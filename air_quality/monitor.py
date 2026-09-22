@@ -7,7 +7,7 @@ import math
 from .gaussian import _check_finite, _is_number
 from .warning import _validate_matrix, _validate_thresholds
 
-__all__ = ["alert", "compare", "evaluate", "summarize"]
+__all__ = ["alert", "compare", "evaluate", "ewma", "summarize"]
 
 
 def _validate_tolerance(tolerance: object) -> float:
@@ -19,6 +19,30 @@ def _validate_tolerance(tolerance: object) -> float:
     _check_finite("tolerance", value)
     if value < 0:
         raise ValueError(f"tolerance must be >= 0, got {value!r}")
+    return value
+
+
+def _validate_alpha(alpha: object) -> float:
+    if not _is_number(alpha):
+        raise TypeError(
+            f"alpha must be an int or float, got {type(alpha).__name__}"
+        )
+    value = float(alpha)
+    _check_finite("alpha", value)
+    if not 0 < value <= 1:
+        raise ValueError(f"alpha must be in (0, 1], got {value!r}")
+    return value
+
+
+def _validate_threshold(threshold: object) -> float:
+    if not _is_number(threshold):
+        raise TypeError(
+            f"threshold must be an int or float, got {type(threshold).__name__}"
+        )
+    value = float(threshold)
+    _check_finite("threshold", value)
+    if value < 0:
+        raise ValueError(f"threshold must be >= 0, got {value!r}")
     return value
 
 
@@ -305,3 +329,78 @@ def summarize(
         triggered.append(sum(1 for value in column if value > 0))
 
     return total, peak, levels, times, triggered
+
+
+def ewma(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    alpha: float,
+    threshold: float,
+    tolerance: float = 0.0,
+) -> tuple[list[float], list[float], list[int], list[int]]:
+    """Track prediction errors per receptor with an EWMA recursion.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    alpha: non-bool finite int or float in (0, 1]; the EWMA smoothing
+        factor.
+    threshold: non-bool finite int or float >= 0; the EWMA trigger
+        level.
+    tolerance: non-bool finite int or float >= 0 (default 0.0); absolute
+        errors up to ``tolerance + uncertainty[t][i]`` are disregarded.
+
+    Returns ``(final, peak, first, triggered)``, plain lists of length N
+    in receptor order, where for each time ``t`` and receptor ``i``::
+
+        x[t][i] = max(abs(predicted[t][i] - observed[t][i])
+                      - tolerance - uncertainty[t][i], 0.0)
+        s[-1][i] = 0
+        s[t][i] = alpha * x[t][i] + (1 - alpha) * s[t - 1][i]
+        final[i] = s[K - 1][i]
+        peak[i] = max(s[t][i] for t)
+        first[i] = smallest t with s[t][i] >= threshold   (-1 if none)
+        triggered[i] = sum(1 for t if s[t][i] >= threshold)
+
+    ``final`` and ``peak`` are floats; ``first`` and ``triggered`` are
+    ints; results are not rounded.
+    """
+    obs, pred, unc, tol = _validate_inputs(
+        observed, predicted, uncertainty, tolerance
+    )
+    smoothing = _validate_alpha(alpha)
+    trigger = _validate_threshold(threshold)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    final: list[float] = []
+    peak: list[float] = []
+    first: list[int] = []
+    triggered: list[int] = []
+    for i in range(n_receptors):
+        s = 0.0
+        peak_value = 0.0
+        first_time = -1
+        trigger_count = 0
+        for t in range(n_rows):
+            x = max(abs(pred[t][i] - obs[t][i]) - tol - unc[t][i], 0.0)
+            s = smoothing * x + (1 - smoothing) * s
+            if s > peak_value:
+                peak_value = s
+            if s >= trigger:
+                if first_time < 0:
+                    first_time = t
+                trigger_count += 1
+        final.append(s)
+        peak.append(peak_value)
+        first.append(first_time)
+        triggered.append(trigger_count)
+
+    return final, peak, first, triggered
