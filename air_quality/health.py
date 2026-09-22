@@ -6,10 +6,12 @@ import math
 
 from .gaussian import _check_finite, _is_number
 
-__all__ = ["assess"]
+__all__ = ["aggregate", "assess"]
 
 
-def _validate_matrix(name: str, matrix: object) -> list[list[float]]:
+def _validate_matrix(
+    name: str, matrix: object, nonneg: bool = True
+) -> list[list[float]]:
     if not isinstance(matrix, (list, tuple)):
         raise TypeError(f"{name} must be a list or tuple, got {type(matrix).__name__}")
     if len(matrix) == 0:
@@ -38,7 +40,7 @@ def _validate_matrix(name: str, matrix: object) -> list[list[float]]:
                 )
             value = float(item)
             _check_finite(f"{name}[{k}][{i}]", value)
-            if value < 0:
+            if nonneg and value < 0:
                 raise ValueError(f"{name}[{k}][{i}] must be >= 0, got {value!r}")
             values.append(value)
         validated.append(values)
@@ -165,3 +167,111 @@ def assess(
     Q = [math.hypot(*row) for row in W]
 
     return H, S, W, Q
+
+
+def aggregate(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[list[float], list[float], list[float], list[float], float, float]:
+    """Aggregate scenario health impacts across scenarios per receptor.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (it may
+        be negative).
+    W: matrix of mutually independent standard uncertainties with the same
+        shape as ``H``; each value must be finite and >= 0.
+    weights: ``None`` or a non-empty list or tuple with one finite, >= 0
+        weight per scenario; the weights must not all sum to 0. ``None``
+        gives each scenario weight ``1 / K``.
+    z: finite, >= 0 multiplier applied to the combined standard
+        uncertainty (default 1.96 for a 95% interval).
+    Returns ``(M, R, lower, upper, total, total_spread)`` where, with
+    ``w[k]`` the normalized scenario weights:
+
+    * ``M[i] = fsum(w[k] * H[k][i])``,
+    * ``V[i] = fsum(w[k] * ((H[k][i] - M[i]) ** 2 + W[k][i] ** 2))``,
+    * ``R[i] = z * sqrt(V[i])``,
+    * ``lower[i] = M[i] - R[i]``,
+    * ``upper[i] = M[i] + R[i]``,
+    * ``total = fsum(M)``,
+    * ``total_spread = hypot(*R)``, equal to
+      ``sqrt(fsum(R[i] ** 2))`` but without intermediate overflow.
+
+    The first four results are plain N-long lists of floats in input
+    order; the last two are floats. Results are not rounded.
+    """
+    impacts = _validate_matrix("H", H, nonneg=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if weights is None:
+        w = [1.0 / n_scenarios] * n_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != n_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {n_scenarios}, "
+                f"got {len(weights)}"
+            )
+        w = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            w.append(value)
+        total_weight = math.fsum(w)
+        if total_weight <= 0:
+            raise ValueError(f"weights must sum to a value > 0, got {total_weight!r}")
+        w = [value / total_weight for value in w]
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    M: list[float] = []
+    R: list[float] = []
+    lower: list[float] = []
+    upper: list[float] = []
+    for i in range(n_receptors):
+        mean = math.fsum(w[k] * impacts[k][i] for k in range(n_scenarios))
+        variance = math.fsum(
+            w[k] * ((impacts[k][i] - mean) ** 2 + uncertainties[k][i] ** 2)
+            for k in range(n_scenarios)
+        )
+        spread = z * math.sqrt(variance)
+        M.append(mean)
+        R.append(spread)
+        lower.append(mean - spread)
+        upper.append(mean + spread)
+
+    total = math.fsum(M)
+    total_spread = math.hypot(*R)
+
+    return M, R, lower, upper, total, total_spread
