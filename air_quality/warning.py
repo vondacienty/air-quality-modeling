@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 
-from .gaussian import _check_finite, _is_number
+from .gaussian import _check_finite, _is_number, _validate_scalar
 
-__all__ = ["assess"]
+__all__ = ["assess", "forecast"]
 
 
 def _validate_matrix(
@@ -73,6 +73,32 @@ def _validate_thresholds(thresholds: object) -> list[float]:
                 f"thresholds[{j - 1}]={validated[j - 1]!r} and "
                 f"thresholds[{j}]={value!r}"
             )
+        validated.append(value)
+    return validated
+
+
+def _validate_population(population: object, length: int) -> list[float]:
+    if not isinstance(population, (list, tuple)):
+        raise TypeError(
+            f"population must be a list or tuple, got {type(population).__name__}"
+        )
+    if len(population) == 0:
+        raise ValueError("population must not be empty")
+    if len(population) != length:
+        raise ValueError(
+            f"population must have {length} elements, got {len(population)}"
+        )
+    validated = []
+    for i, item in enumerate(population):
+        if not _is_number(item):
+            raise TypeError(
+                f"population[{i}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"population[{i}]", value)
+        if value < 0:
+            raise ValueError(f"population[{i}] must be >= 0, got {value!r}")
         validated.append(value)
     return validated
 
@@ -155,5 +181,82 @@ def assess(
             levels.append(level)
             evidence.append((i_total, v_total))
             scores.append(score)
+
+    return levels, evidence, scores
+
+
+def forecast(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+) -> tuple[
+    list[int],
+    list[tuple[float, float]],
+    list[float],
+]:
+    """Forecast warning levels over time for a population-weighted scenario.
+
+    values: non-empty time x receptor matrix (K x N, K, N >= 1) of forecast
+        values; both the outer container and each row must be a list or
+        tuple, rows must be non-empty and share one receptor count; each
+        value finite and >= 0.
+    uncertainty: matrix of forecast uncertainties with the same shape and
+        constraints as ``values``.
+    population: list or tuple of N finite, non-negative population weights.
+    beta: finite, non-negative scaling factor (non-bool int or float).
+    thresholds: list or tuple of 3 strictly increasing, finite, non-negative
+        warning thresholds.
+    Returns ``(levels, evidence, scores)`` where, for each time ``t`` and
+    receptor ``i``, with ``h[i] = population[i] * beta * values[t][i]`` and
+    ``w[i] = population[i] * beta * uncertainty[t][i]``:
+
+    * ``I = fsum(max(h[i], 0.0) for i in range(N))``,
+    * ``V = hypot(*w)``, equal to ``sqrt(fsum(x ** 2 for x in w))`` but
+      without intermediate overflow,
+    * ``scores[t] = I + V``,
+    * ``levels[t]`` is the count of thresholds ``<= scores[t]`` (0-3),
+    * ``evidence[t] = (I, V)``.
+
+    All results are plain lists in time order and are not rounded.
+    """
+    forecast_values = _validate_matrix("values", values, allow_negative=False)
+    uncertainties = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+
+    if len(uncertainties) != len(forecast_values):
+        raise ValueError(
+            f"values and uncertainty must have the same number of rows, "
+            f"got {len(forecast_values)} and {len(uncertainties)}"
+        )
+    n_receptors = len(forecast_values[0])
+    for t, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"uncertainty[{t}] must have {n_receptors} elements, "
+                f"got {len(row)}"
+            )
+
+    weights = _validate_population(population, n_receptors)
+
+    factor = _validate_scalar("beta", beta)
+    if factor < 0:
+        raise ValueError(f"beta must be >= 0, got {factor!r}")
+
+    levels_thresholds = _validate_thresholds(thresholds)
+
+    levels: list[int] = []
+    evidence: list[tuple[float, float]] = []
+    scores: list[float] = []
+    for t in range(len(forecast_values)):
+        h = [weights[i] * factor * forecast_values[t][i] for i in range(n_receptors)]
+        w = [weights[i] * factor * uncertainties[t][i] for i in range(n_receptors)]
+        i_total = math.fsum(max(h[i], 0.0) for i in range(n_receptors))
+        v_total = math.hypot(*w)
+        score = i_total + v_total
+        level = sum(1 for threshold in levels_thresholds if threshold <= score)
+        levels.append(level)
+        evidence.append((i_total, v_total))
+        scores.append(score)
 
     return levels, evidence, scores
