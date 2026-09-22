@@ -9,6 +9,7 @@ from .warning import _validate_matrix, _validate_thresholds
 
 __all__ = [
     "alert",
+    "calibrate",
     "compare",
     "cusum",
     "evaluate",
@@ -345,6 +346,90 @@ def interval_score(
         score.append(math.fsum(scores) / n_rows)
 
     return coverage, width, score
+
+
+def calibrate(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    alpha: float = 0.1,
+) -> tuple[list[float], list[float], list[float]]:
+    """Calibrate per-receptor interval multipliers from past errors.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    alpha: non-bool finite int or float strictly between 0 and 1
+        (default 0.1); target miss rate for the calibrated intervals.
+
+    Writing ``r[t][i] = abs(predicted[t][i] - observed[t][i]) /
+    max(uncertainty[t][i], 1e-12)``, sort the ``r[t][i]`` for each
+    receptor ``i`` ascending by ``(r[t][i], t)`` and set
+    ``j = max(0, min(K - 1, ceil((1 - alpha) * K) - 1))``; then
+    ``scale[i]`` is the ``r`` value at position ``j`` and, elementwise::
+
+        lo[t][i] = predicted[t][i] - scale[i] * uncertainty[t][i]
+        hi[t][i] = predicted[t][i] + scale[i] * uncertainty[t][i]
+        coverage[i] = sum(lo[t][i] <= observed[t][i] <= hi[t][i]
+                          for t) / K
+        width[i] = fsum(hi[t][i] - lo[t][i] for t) / K
+
+    Returns ``(scale, coverage, width)``, plain lists of length N in
+    receptor order. All results are floats and are not rounded.
+    """
+    obs = _validate_matrix("observed", observed, allow_negative=True)
+    pred = _validate_matrix("predicted", predicted, allow_negative=True)
+    unc = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    alpha_value = _validate_interval_alpha(alpha)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    for name, matrix in (("predicted", pred), ("uncertainty", unc)):
+        if len(matrix) != n_rows:
+            raise ValueError(
+                f"observed and {name} must have the same number of rows, "
+                f"got {n_rows} and {len(matrix)}"
+            )
+        for t, row in enumerate(matrix):
+            if len(row) != n_receptors:
+                raise ValueError(
+                    f"{name}[{t}] must have {n_receptors} elements, "
+                    f"got {len(row)}"
+                )
+
+    j = max(0, min(n_rows - 1, math.ceil((1.0 - alpha_value) * n_rows) - 1))
+    scale: list[float] = []
+    coverage: list[float] = []
+    width: list[float] = []
+    for i in range(n_receptors):
+        ratios = [
+            (
+                abs(pred[t][i] - obs[t][i]) / max(unc[t][i], 1e-12),
+                t,
+            )
+            for t in range(n_rows)
+        ]
+        ratios.sort()
+        scale_i = ratios[j][0]
+        scale.append(scale_i)
+        inside = 0
+        widths: list[float] = []
+        for t in range(n_rows):
+            low = pred[t][i] - scale_i * unc[t][i]
+            high = pred[t][i] + scale_i * unc[t][i]
+            widths.append(high - low)
+            if low <= obs[t][i] <= high:
+                inside += 1
+        coverage.append(inside / n_rows)
+        width.append(math.fsum(widths) / n_rows)
+
+    return scale, coverage, width
 
 
 def alert(
