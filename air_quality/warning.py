@@ -6,7 +6,7 @@ import math
 
 from .gaussian import _check_finite, _is_number, _validate_scalar
 
-__all__ = ["assess", "forecast", "forecast_interval"]
+__all__ = ["assess", "forecast", "forecast_interval", "aggregate"]
 
 
 def _validate_matrix(
@@ -348,3 +348,131 @@ def forecast_interval(
         high_scores.append(high_score)
 
     return low_levels, high_levels, low_scores, high_scores
+
+
+def aggregate(
+    T: list[list[float]] | tuple[tuple[float, ...], ...],
+    U: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[int, float, int, int, float, float, list[float], list[float]]:
+    """Aggregate weighted scenario means into a population-weighted warning.
+
+    T: non-empty list or tuple of K scenarios; each scenario is a
+        non-empty list or tuple of N values at every receptor; each value
+        finite and >= 0. All scenarios must share one shape.
+    U: uncertainty matrix following the same contract as ``T`` and with
+        the same K-by-N shape.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    weights: ``None`` for equal weights (``w[k] = 1 / K``), or a list or
+        tuple of K finite, non-negative numbers; their sum must be > 0.
+        Weights are normalized to sum to one.
+    z: finite, non-negative confidence multiplier (default 1.96).
+
+    Writing ``F(x) = math.fsum(x[k] for k in range(K))`` and
+    ``G(x) = math.fsum(x[i] for i in range(N))``::
+
+        M[i] = F(w[k] * T[k][i])
+        V[i] = F(w[k] * ((T[k][i] - M[i]) ** 2 + U[k][i] ** 2))
+        R[i] = z * sqrt(V[i])
+        J[i] = population[i] * beta
+        S = G(J[i] * M[i])
+        L = G(J[i] * max(M[i] - R[i], 0.0))
+        H = G(J[i] * (M[i] + R[i]))
+        level      = number of thresholds <= S   (0-3)
+        low_level  = number of thresholds <= L   (0-3)
+        high_level = number of thresholds <= H   (0-3)
+
+    Returns ``(level, S, low_level, high_level, L, H, M, R)``. ``level``,
+    ``low_level`` and ``high_level`` are ints; ``S``, ``L`` and ``H`` are
+    floats; ``M`` and ``R`` are N-long plain lists of floats. Results are
+    not rounded.
+    """
+    parsed_t = _validate_matrix("T", T, allow_negative=False)
+    parsed_u = _validate_matrix("U", U, allow_negative=False)
+    if len(parsed_u) != len(parsed_t):
+        raise ValueError(
+            f"T and U must have the same number of scenarios, "
+            f"got {len(parsed_t)} and {len(parsed_u)}"
+        )
+    for k, (row_t, row_u) in enumerate(zip(parsed_t, parsed_u)):
+        if len(row_u) != len(row_t):
+            raise ValueError(
+                f"U[{k}] must have {len(row_t)} elements, got {len(row_u)}"
+            )
+
+    k_scenarios = len(parsed_t)
+    n_receptors = len(parsed_t[0])
+
+    populations = _validate_vector("population", population, n_receptors)
+    beta_value = _validate_scalar("beta", beta)
+    if beta_value < 0:
+        raise ValueError(f"beta must be >= 0, got {beta_value!r}")
+    levels_thresholds = _validate_thresholds(thresholds)
+
+    if weights is None:
+        w = [1.0 / k_scenarios] * k_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != k_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {k_scenarios}, "
+                f"got {len(weights)}"
+            )
+        validated_weights = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            validated_weights.append(value)
+        s = math.fsum(validated_weights)
+        if s <= 0:
+            raise ValueError(f"weights sum must be > 0, got {s!r}")
+        w = [value / s for value in validated_weights]
+
+    z_value = _validate_scalar("z", z)
+    if z_value < 0:
+        raise ValueError(f"z must be >= 0, got {z_value!r}")
+
+    M = [
+        math.fsum(w[k] * parsed_t[k][i] for k in range(k_scenarios))
+        for i in range(n_receptors)
+    ]
+    V = [
+        math.fsum(
+            w[k]
+            * ((parsed_t[k][i] - M[i]) ** 2 + parsed_u[k][i] ** 2)
+            for k in range(k_scenarios)
+        )
+        for i in range(n_receptors)
+    ]
+    R = [z_value * math.sqrt(V[i]) for i in range(n_receptors)]
+
+    J = [populations[i] * beta_value for i in range(n_receptors)]
+    S = math.fsum(J[i] * M[i] for i in range(n_receptors))
+    L = math.fsum(
+        J[i] * max(M[i] - R[i], 0.0) for i in range(n_receptors)
+    )
+    H = math.fsum(J[i] * (M[i] + R[i]) for i in range(n_receptors))
+
+    level = sum(1 for t_value in levels_thresholds if t_value <= S)
+    low_level = sum(1 for t_value in levels_thresholds if t_value <= L)
+    high_level = sum(1 for t_value in levels_thresholds if t_value <= H)
+
+    return level, S, low_level, high_level, L, H, M, R
