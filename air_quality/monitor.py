@@ -7,7 +7,7 @@ import math
 from .gaussian import _check_finite, _is_number
 from .warning import _validate_matrix, _validate_thresholds
 
-__all__ = ["alert", "compare", "cusum", "evaluate", "ewma", "summarize"]
+__all__ = ["alert", "compare", "cusum", "evaluate", "ewma", "persistence", "summarize"]
 
 
 def _validate_tolerance(tolerance: object) -> float:
@@ -56,6 +56,16 @@ def _validate_drift(drift: object) -> float:
     if value < 0:
         raise ValueError(f"drift must be >= 0, got {value!r}")
     return value
+
+
+def _validate_minimum(minimum: object) -> int:
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+    return minimum
 
 
 def _validate_inputs(
@@ -423,6 +433,89 @@ def cusum(
         triggered.append(trigger_count)
 
     return final, peak, first, triggered
+
+
+def persistence(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    tolerance: float = 0.0,
+    minimum: int = 1,
+) -> tuple[list[int], list[int], list[int]]:
+    """Longest and qualifying runs of consecutive prediction exceedances.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    tolerance: non-bool finite int or float >= 0 (default 0.0); an
+        absolute error is an exceedance only when it is strictly greater
+        than ``tolerance + uncertainty[t][i]``.
+    minimum: non-bool int >= 1 (default 1); a run counts as qualifying
+        when its length is at least ``minimum``.
+
+    Returns ``(longest, first_start, qualifying_runs)``, plain lists of
+    length N in receptor order. Writing
+    ``x[t][i] = abs(predicted[t][i] - observed[t][i]) > tolerance +
+    uncertainty[t][i]`` and grouping adjacent ``True`` values in each
+    column into maximal consecutive runs:
+
+    * ``longest[i]`` is the length of the longest run, or 0 when there
+      are no runs;
+    * ``first_start[i]`` is the smallest ``t`` at which a longest run
+      starts, or -1 when there are no runs;
+    * ``qualifying_runs[i]`` is the number of runs whose length is
+      ``>= minimum``.
+
+    All results are ints.
+    """
+    obs, pred, unc, tol = _validate_inputs(
+        observed, predicted, uncertainty, tolerance
+    )
+    min_length = _validate_minimum(minimum)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    longest: list[int] = []
+    first_start: list[int] = []
+    qualifying_runs: list[int] = []
+    for i in range(n_receptors):
+        longest_length = 0
+        longest_start = -1
+        qualifying = 0
+        run_start = -1
+        run_length = 0
+        for t in range(n_rows):
+            if abs(pred[t][i] - obs[t][i]) > tol + unc[t][i]:
+                if run_length == 0:
+                    run_start = t
+                run_length += 1
+                continue
+            if run_length > 0:
+                if run_length > longest_length:
+                    longest_length = run_length
+                    longest_start = run_start
+                if run_length >= min_length:
+                    qualifying += 1
+                run_length = 0
+                run_start = -1
+        if run_length > 0:
+            if run_length > longest_length:
+                longest_length = run_length
+                longest_start = run_start
+            if run_length >= min_length:
+                qualifying += 1
+
+        longest.append(longest_length)
+        first_start.append(longest_start)
+        qualifying_runs.append(qualifying)
+
+    return longest, first_start, qualifying_runs
 
 
 def summarize(
