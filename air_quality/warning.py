@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 
-from .gaussian import _check_finite, _is_number
+from .gaussian import _check_finite, _is_number, _validate_scalar
 
-__all__ = ["assess"]
+__all__ = ["assess", "forecast"]
 
 
 def _validate_matrix(
@@ -73,6 +73,27 @@ def _validate_thresholds(thresholds: object) -> list[float]:
                 f"thresholds[{j - 1}]={validated[j - 1]!r} and "
                 f"thresholds[{j}]={value!r}"
             )
+        validated.append(value)
+    return validated
+
+
+def _validate_vector(name: str, vector: object, length: int) -> list[float]:
+    if not isinstance(vector, (list, tuple)):
+        raise TypeError(
+            f"{name} must be a list or tuple, got {type(vector).__name__}"
+        )
+    if len(vector) != length:
+        raise ValueError(f"{name} must have {length} elements, got {len(vector)}")
+    validated = []
+    for i, item in enumerate(vector):
+        if not _is_number(item):
+            raise TypeError(
+                f"{name}[{i}] must be an int or float, got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"{name}[{i}]", value)
+        if value < 0:
+            raise ValueError(f"{name}[{i}] must be >= 0, got {value!r}")
         validated.append(value)
     return validated
 
@@ -155,5 +176,82 @@ def assess(
             levels.append(level)
             evidence.append((i_total, v_total))
             scores.append(score)
+
+    return levels, evidence, scores
+
+
+def forecast(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+) -> tuple[
+    list[int],
+    list[tuple[float, float]],
+    list[float],
+]:
+    """Forecast population-weighted air quality warning levels over time.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    Returns ``(levels, evidence, scores)``, plain lists in time order,
+    where for each time ``t`` and receptor ``i``::
+
+        h[i] = population[i] * beta * values[t][i]
+        w[i] = population[i] * beta * uncertainty[t][i]
+        I[t] = fsum(max(h[i], 0.0) for i in range(N))
+        V[t] = hypot(*w)
+        score[t] = I[t] + V[t]
+        level[t] = number of thresholds <= score[t]   (0-3)
+
+    and ``evidence[t] = (I[t], V[t])``. Results are not rounded.
+    """
+    val_matrix = _validate_matrix("values", values, allow_negative=False)
+    unc_matrix = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+
+    if len(unc_matrix) != len(val_matrix):
+        raise ValueError(
+            f"values and uncertainty must have the same number of rows, "
+            f"got {len(val_matrix)} and {len(unc_matrix)}"
+        )
+    n_receptors = len(val_matrix[0])
+    for t, row in enumerate(unc_matrix):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"uncertainty[{t}] must have {n_receptors} elements, "
+                f"got {len(row)}"
+            )
+
+    populations = _validate_vector("population", population, n_receptors)
+    beta_value = _validate_scalar("beta", beta)
+    if beta_value < 0:
+        raise ValueError(f"beta must be >= 0, got {beta_value!r}")
+    levels_thresholds = _validate_thresholds(thresholds)
+
+    levels: list[int] = []
+    evidence: list[tuple[float, float]] = []
+    scores: list[float] = []
+    for t in range(len(val_matrix)):
+        h_row = [populations[i] * beta_value * val_matrix[t][i]
+                 for i in range(n_receptors)]
+        w_row = [populations[i] * beta_value * unc_matrix[t][i]
+                 for i in range(n_receptors)]
+        i_total = math.fsum(max(h, 0.0) for h in h_row)
+        v_total = math.hypot(*w_row)
+        score = i_total + v_total
+        level = sum(1 for t_value in levels_thresholds if t_value <= score)
+        levels.append(level)
+        evidence.append((i_total, v_total))
+        scores.append(score)
 
     return levels, evidence, scores
