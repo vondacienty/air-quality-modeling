@@ -7,7 +7,15 @@ import math
 from .gaussian import _check_finite, _is_number
 from .warning import _validate_matrix, _validate_thresholds
 
-__all__ = ["alert", "compare", "cusum", "evaluate", "ewma", "summarize"]
+__all__ = [
+    "alert",
+    "compare",
+    "cusum",
+    "evaluate",
+    "ewma",
+    "persistence",
+    "summarize",
+]
 
 
 def _validate_tolerance(tolerance: object) -> float:
@@ -20,6 +28,16 @@ def _validate_tolerance(tolerance: object) -> float:
     if value < 0:
         raise ValueError(f"tolerance must be >= 0, got {value!r}")
     return value
+
+
+def _validate_minimum(minimum: object) -> int:
+    if isinstance(minimum, bool) or not isinstance(minimum, int):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum!r}")
+    return minimum
 
 
 def _validate_alpha(alpha: object) -> float:
@@ -494,3 +512,83 @@ def summarize(
         triggered.append(sum(1 for value in column if value > 0))
 
     return total, peak, levels, times, triggered
+
+
+def persistence(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    tolerance: float = 0.0,
+    minimum: int = 1,
+) -> tuple[list[int], list[int], list[int]]:
+    """Lengths of consecutive prediction-exceedance runs per receptor.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    tolerance: non-bool finite int or float >= 0 (default 0.0); an
+        absolute error is an exceedance only when it is strictly greater
+        than ``tolerance + uncertainty[t][i]``.
+    minimum: non-bool int >= 1 (default 1); a run is counted in
+        ``qualifying_runs`` when its length is at least ``minimum``.
+
+    Returns ``(longest, first_start, qualifying_runs)``, plain lists of
+    length N in receptor order. Writing ``x[t][i] =
+    abs(predicted[t][i] - observed[t][i]) > tolerance +
+    uncertainty[t][i]``, adjacent true values within each column form
+    consecutive runs, and for each receptor ``i``:
+
+    * ``longest[i]`` is the length of the longest run (0 if no run),
+    * ``first_start[i]`` is the smallest starting index ``t`` among the
+      runs whose length equals ``longest[i]`` (-1 if no run),
+    * ``qualifying_runs[i]`` is the number of runs whose length is
+      ``>= minimum``.
+
+    All results are ints and are not rounded.
+    """
+    obs, pred, unc, tol = _validate_inputs(
+        observed, predicted, uncertainty, tolerance
+    )
+    minimum_value = _validate_minimum(minimum)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    longest: list[int] = []
+    first_start: list[int] = []
+    qualifying_runs: list[int] = []
+    for i in range(n_receptors):
+        column_longest = 0
+        column_first = -1
+        column_qualifying = 0
+        run_start = 0
+        run_length = 0
+        for t in range(n_rows):
+            if abs(pred[t][i] - obs[t][i]) > tol + unc[t][i]:
+                if run_length == 0:
+                    run_start = t
+                run_length += 1
+            else:
+                if run_length > 0:
+                    if run_length > column_longest:
+                        column_longest = run_length
+                        column_first = run_start
+                    if run_length >= minimum_value:
+                        column_qualifying += 1
+                    run_length = 0
+        if run_length > 0:
+            if run_length > column_longest:
+                column_longest = run_length
+                column_first = run_start
+            if run_length >= minimum_value:
+                column_qualifying += 1
+        longest.append(column_longest)
+        first_start.append(column_first)
+        qualifying_runs.append(column_qualifying)
+
+    return longest, first_start, qualifying_runs
