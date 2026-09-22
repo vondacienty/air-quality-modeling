@@ -100,7 +100,8 @@ def assess(
     * ``H[k][i] = P[i] * beta * D[k][i]``,
     * ``W[k][i] = P[i] * beta * E[k][i]``,
     * ``S[k] = fsum(H[k])``,
-    * ``Q[k] = sqrt(fsum(W[k][i] ** 2))``.
+    * ``Q[k] = hypot(*W[k])``, equal to ``sqrt(fsum(W[k][i] ** 2))``
+      but without intermediate overflow.
 
     The baseline row of ``H`` and ``W`` (and the corresponding ``S`` and
     ``Q`` entries) are exactly 0.0. All results are plain lists of floats
@@ -161,6 +162,6 @@ def assess(
         W.append(w_row)
 
     S = [math.fsum(row) for row in H]
-    Q = [math.sqrt(math.fsum(w * w for w in row)) for row in W]
+    Q = [math.hypot(*row) for row in W]
 
     return H, S, W, Q
