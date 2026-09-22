@@ -161,6 +161,13 @@ def assess(
         W.append(w_row)
 
     S = [math.fsum(row) for row in H]
-    Q = [math.sqrt(math.fsum(w * w for w in row)) for row in W]
+    Q = []
+    for row in W:
+        # Iterative hypot accumulation: equivalent to sqrt(fsum(w**2))
+        # but without overflow in any intermediate quantity.
+        q = 0.0
+        for w in row:
+            q = math.hypot(q, w)
+        Q.append(q)
 
     return H, S, W, Q
