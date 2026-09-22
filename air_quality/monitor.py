@@ -7,7 +7,7 @@ import math
 from .gaussian import _check_finite, _is_number
 from .warning import _validate_matrix, _validate_thresholds
 
-__all__ = ["alert", "compare", "evaluate"]
+__all__ = ["alert", "compare", "evaluate", "summarize"]
 
 
 def _validate_tolerance(tolerance: object) -> float:
@@ -234,3 +234,79 @@ def alert(
         )
 
     return levels, evidence, scores
+
+
+def summarize(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    tolerance: float = 0.0,
+) -> tuple[list[float], list[float], list[int], list[int], list[int]]:
+    """Summarize per-receptor exceedance of prediction errors over time.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative thresholds.
+    tolerance: non-bool finite int or float >= 0 (default 0.0); absolute
+        errors up to ``tolerance + uncertainty[t][i]`` are disregarded.
+
+    Returns ``(total, peak, levels, times, triggered)``, five plain
+    lists of length N in receptor order, where for each receptor ``i``::
+
+        x[t][i] = max(abs(predicted[t][i] - observed[t][i])
+                      - tolerance - uncertainty[t][i], 0.0)
+        total[i]     = fsum(x[t][i] for t)
+        peak[i]      = max(x[t][i] for t)
+        times[i]     = smallest t with x[t][i] == peak[i]
+        levels[i]    = number of thresholds <= peak[i]   (0-3)
+        triggered[i] = number of t with x[t][i] > 0
+
+    ``total`` and ``peak`` entries are floats and ``levels``, ``times``
+    and ``triggered`` entries are ints; results are not rounded.
+    """
+    obs, pred, unc, tol = _validate_inputs(
+        observed, predicted, uncertainty, tolerance
+    )
+    levels_thresholds = _validate_thresholds(thresholds)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    x = [
+        [
+            max(abs(pred[t][i] - obs[t][i]) - tol - unc[t][i], 0.0)
+            for i in range(n_receptors)
+        ]
+        for t in range(n_rows)
+    ]
+
+    total: list[float] = []
+    peak: list[float] = []
+    levels: list[int] = []
+    times: list[int] = []
+    triggered: list[int] = []
+    for i in range(n_receptors):
+        column = [x[t][i] for t in range(n_rows)]
+        total.append(math.fsum(column))
+        peak_value = column[0]
+        peak_time = 0
+        for t in range(1, n_rows):
+            if column[t] > peak_value:
+                peak_value = column[t]
+                peak_time = t
+        peak.append(peak_value)
+        times.append(peak_time)
+        levels.append(
+            sum(1 for threshold in levels_thresholds if threshold <= peak_value)
+        )
+        triggered.append(sum(1 for value in column if value > 0))
+
+    return total, peak, levels, times, triggered
