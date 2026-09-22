@@ -7,7 +7,7 @@ import math
 from .attribution import attribute
 from .gaussian import _check_finite, _is_number
 
-__all__ = ["predict", "aggregate", "quantile"]
+__all__ = ["predict", "aggregate", "quantile", "forecast"]
 
 
 def _validate_scenarios(name: str, values: object) -> list | tuple:
@@ -389,3 +389,129 @@ def quantile(
         H.append(h_row)
 
     return Q, L, H
+
+
+def forecast(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    horizon: int,
+    z: float = 1.96,
+) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
+    """Least-squares linear trend forecast with prediction bands.
+
+    values: non-empty list or tuple of K times (``K >= 2``); each time is
+        a non-empty list or tuple of concentrations at every receptor;
+        each value must be a finite, non-bool int or float with value >= 0.
+        All times must share one shape K-by-N.
+    uncertainty: uncertainty matrix following the same contract as
+        ``values`` and with the same K-by-N shape.
+    horizon: non-bool int >= 1 giving the number of future steps to
+        forecast.
+    z: non-bool, finite int or float >= 0 giving the band multiplier.
+
+    Times are indexed ``t = 0, ..., K - 1`` and ``S(e) =
+    math.fsum(e[t] for t in range(K))``. Writing ``tb = (K - 1) / 2`` and
+    ``den = S((t - tb) ** 2)``, a least-squares line is fit per receptor i:
+
+    * ``b = S((t - tb) * values[t][i]) / den``,
+    * ``a = S(values[t][i]) / K - b * tb``,
+    * ``r = S((values[t][i] - a - b * t) ** 2) / (K - 2)`` (divided by 1
+      when ``K == 2``).
+
+    For every future step ``s = 0, ..., horizon - 1``, writing
+    ``tau = K + s``:
+
+    * ``m = a + b * tau``,
+    * ``e = sqrt(S(uncertainty[t][i] ** 2) / K
+      + r * (1 + 1 / K + (tau - tb) ** 2 / den))``,
+    * ``forecast[s][i] = m``,
+    * ``lower[s][i] = max(0, m - z * e)``,
+    * ``upper[s][i] = m + z * e``.
+
+    Returns ``(forecast, lower, upper)``, each an horizon-by-N plain list
+    of floats ordered by forecast step and then by receptor. Results are
+    not rounded.
+    """
+    parsed_v = _validate_matrix("values", values)
+    parsed_u = _validate_matrix("uncertainty", uncertainty)
+    if len(parsed_u) != len(parsed_v):
+        raise ValueError(
+            f"values and uncertainty must have the same number of times, got {len(parsed_v)} and {len(parsed_u)}"
+        )
+    for k, (row_v, row_u) in enumerate(zip(parsed_v, parsed_u)):
+        if len(row_u) != len(row_v):
+            raise ValueError(
+                f"uncertainty[{k}] must have {len(row_v)} elements, got {len(row_u)}"
+            )
+
+    k_times = len(parsed_v)
+    if k_times < 2:
+        raise ValueError(f"values must have at least 2 times, got {k_times}")
+
+    if isinstance(horizon, bool) or not isinstance(horizon, int):
+        raise TypeError(
+            f"horizon must be an int, got {type(horizon).__name__}"
+        )
+    if horizon < 1:
+        raise ValueError(f"horizon must be >= 1, got {horizon!r}")
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    n_receptors = len(parsed_v[0])
+    tb = (k_times - 1) / 2.0
+    den = math.fsum((t - tb) ** 2 for t in range(k_times))
+    residual_denom = k_times - 2 if k_times > 2 else 1
+
+    intercepts = []
+    slopes = []
+    residual_vars = []
+    uncertainty_means = []
+    for i in range(n_receptors):
+        slope = (
+            math.fsum((t - tb) * parsed_v[t][i] for t in range(k_times)) / den
+        )
+        intercept = (
+            math.fsum(parsed_v[t][i] for t in range(k_times)) / k_times
+            - slope * tb
+        )
+        residual = math.fsum(
+            (parsed_v[t][i] - intercept - slope * t) ** 2
+            for t in range(k_times)
+        ) / residual_denom
+        u_mean = (
+            math.fsum(parsed_u[t][i] ** 2 for t in range(k_times))
+            / k_times
+        )
+        intercepts.append(intercept)
+        slopes.append(slope)
+        residual_vars.append(residual)
+        uncertainty_means.append(u_mean)
+
+    forecast_rows = []
+    lower_rows = []
+    upper_rows = []
+    for s in range(horizon):
+        tau = k_times + s
+        f_row = []
+        l_row = []
+        h_row = []
+        for i in range(n_receptors):
+            m = intercepts[i] + slopes[i] * tau
+            e = math.sqrt(
+                uncertainty_means[i]
+                + residual_vars[i]
+                * (1.0 + 1.0 / k_times + (tau - tb) ** 2 / den)
+            )
+            f_row.append(m)
+            l_row.append(max(0.0, m - z * e))
+            h_row.append(m + z * e)
+        forecast_rows.append(f_row)
+        lower_rows.append(l_row)
+        upper_rows.append(h_row)
+
+    return forecast_rows, lower_rows, upper_rows
