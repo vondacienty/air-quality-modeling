@@ -7,7 +7,7 @@ import math
 from .attribution import attribute
 from .gaussian import _check_finite, _is_number
 
-__all__ = ["predict", "aggregate"]
+__all__ = ["predict", "aggregate", "quantile"]
 
 
 def _validate_scenarios(name: str, values: object) -> list | tuple:
@@ -51,6 +51,32 @@ def _validate_matrix(name: str, values: object) -> list[list[float]]:
             checked_row.append(value)
         validated.append(checked_row)
     return validated
+
+
+def _validate_weights(weights: object, k_scenarios: int) -> list[float]:
+    if not isinstance(weights, (list, tuple)):
+        raise TypeError(
+            f"weights must be a list or tuple, got {type(weights).__name__}"
+        )
+    if len(weights) != k_scenarios:
+        raise ValueError(
+            f"weights length must equal scenario count {k_scenarios}, got {len(weights)}"
+        )
+    validated_weights = []
+    for k, item in enumerate(weights):
+        if not _is_number(item):
+            raise TypeError(
+                f"weights[{k}] must be an int or float, got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"weights[{k}]", value)
+        if value < 0:
+            raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+        validated_weights.append(value)
+    s = math.fsum(validated_weights)
+    if s <= 0:
+        raise ValueError(f"weights sum must be > 0, got {s!r}")
+    return [value / s for value in validated_weights]
 
 
 def predict(
@@ -194,29 +220,7 @@ def aggregate(
     if weights is None:
         w = [1.0 / k_scenarios] * k_scenarios
     else:
-        if not isinstance(weights, (list, tuple)):
-            raise TypeError(
-                f"weights must be a list or tuple, got {type(weights).__name__}"
-            )
-        if len(weights) != k_scenarios:
-            raise ValueError(
-                f"weights length must equal scenario count {k_scenarios}, got {len(weights)}"
-            )
-        validated_weights = []
-        for k, item in enumerate(weights):
-            if not _is_number(item):
-                raise TypeError(
-                    f"weights[{k}] must be an int or float, got {type(item).__name__}"
-                )
-            value = float(item)
-            _check_finite(f"weights[{k}]", value)
-            if value < 0:
-                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
-            validated_weights.append(value)
-        s = math.fsum(validated_weights)
-        if s <= 0:
-            raise ValueError(f"weights sum must be > 0, got {s!r}")
-        w = [value / s for value in validated_weights]
+        w = _validate_weights(weights, k_scenarios)
 
     if not _is_number(z):
         raise TypeError(f"z must be an int or float, got {type(z).__name__}")
@@ -245,3 +249,126 @@ def aggregate(
     upper = [mean[i] + spread[i] for i in range(n_receptors)]
 
     return mean, spread, lower, upper
+
+
+def quantile(
+    T: list[list[float]] | tuple[tuple[float, ...], ...],
+    U: list[list[float]] | tuple[tuple[float, ...], ...],
+    quantiles: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
+    """Weighted quantiles of scenario totals and their uncertainty bands.
+
+    T: non-empty list or tuple of K scenarios; each scenario is a
+        non-empty list or tuple of total concentrations at every
+        receptor; each value must be a finite, non-bool int or float
+        with value >= 0. All scenarios must share one shape.
+    U: uncertainty matrix following the same contract as ``T`` and with
+        the same K-by-N shape.
+    quantiles: non-empty list or tuple of M finite, non-bool numbers q
+        with ``0 <= q <= 1`` in non-decreasing order.
+    weights: ``None`` for equal weights (``w[k] = 1 / K``), or a list or
+        tuple of K finite, non-bool, non-negative numbers; their sum
+        must be > 0.
+    z: non-bool, finite int or float >= 0 giving the band multiplier.
+
+    For each receptor i and each requested quantile q, three separate
+    orderings of the scenarios are used, each sorted ascending by the
+    value and then by ascending k: one by ``T[k][i]``, one by
+    ``max(0.0, T[k][i] - z * U[k][i])`` and one by
+    ``T[k][i] + z * U[k][i]``. The normalized weights walk each ordering:
+    for ``q == 0`` the first scenario is taken, otherwise the first
+    scenario whose cumulative weight is ``>= q``.
+
+    Returns ``(Q, L, H)``; each is an M-by-N plain list of floats, rows
+    in ``quantiles`` order and columns in receptor order, not rounded.
+    ``Q`` holds the selected totals, ``L`` the selected lower band values
+    and ``H`` the selected upper band values.
+    """
+    parsed_t = _validate_matrix("T", T)
+    parsed_u = _validate_matrix("U", U)
+    if len(parsed_u) != len(parsed_t):
+        raise ValueError(
+            f"T and U must have the same number of scenarios, got {len(parsed_t)} and {len(parsed_u)}"
+        )
+    for k, (row_t, row_u) in enumerate(zip(parsed_t, parsed_u)):
+        if len(row_u) != len(row_t):
+            raise ValueError(
+                f"U[{k}] must have {len(row_t)} elements, got {len(row_u)}"
+            )
+
+    k_scenarios = len(parsed_t)
+    n_receptors = len(parsed_t[0])
+
+    if not isinstance(quantiles, (list, tuple)):
+        raise TypeError(
+            f"quantiles must be a list or tuple, got {type(quantiles).__name__}"
+        )
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must not be empty")
+    qs = []
+    for m, item in enumerate(quantiles):
+        if not _is_number(item):
+            raise TypeError(
+                f"quantiles[{m}] must be an int or float, got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"quantiles[{m}]", value)
+        if not 0 <= value <= 1:
+            raise ValueError(f"quantiles[{m}] must be in [0, 1], got {value!r}")
+        if m > 0 and value < qs[m - 1]:
+            raise ValueError(
+                f"quantiles must be non-decreasing, got {qs[m - 1]!r} before {value!r}"
+            )
+        qs.append(value)
+
+    if weights is None:
+        w = [1.0 / k_scenarios] * k_scenarios
+    else:
+        w = _validate_weights(weights, k_scenarios)
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    Q: list[list[float]] = []
+    L: list[list[float]] = []
+    H: list[list[float]] = []
+
+    def select(series: list[float]) -> float:
+        order = sorted(range(k_scenarios), key=lambda k: (series[k], k))
+        if q == 0:
+            return series[order[0]]
+        cumulative = 0.0
+        for k in order:
+            cumulative += w[k]
+            if cumulative >= q:
+                return series[k]
+        return series[order[-1]]
+
+    for q in qs:
+        q_row = []
+        l_row = []
+        h_row = []
+        for i in range(n_receptors):
+            totals = [parsed_t[k][i] for k in range(k_scenarios)]
+            lowers = [
+                max(0.0, parsed_t[k][i] - z * parsed_u[k][i])
+                for k in range(k_scenarios)
+            ]
+            uppers = [
+                parsed_t[k][i] + z * parsed_u[k][i]
+                for k in range(k_scenarios)
+            ]
+            q_row.append(select(totals))
+            l_row.append(select(lowers))
+            h_row.append(select(uppers))
+        Q.append(q_row)
+        L.append(l_row)
+        H.append(h_row)
+
+    return Q, L, H
