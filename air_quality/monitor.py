@@ -5,9 +5,9 @@ from __future__ import annotations
 import math
 
 from .gaussian import _check_finite, _is_number
-from .warning import _validate_matrix
+from .warning import _validate_matrix, _validate_thresholds
 
-__all__ = ["compare", "evaluate"]
+__all__ = ["alert", "compare", "evaluate"]
 
 
 def _validate_tolerance(tolerance: object) -> float:
@@ -176,3 +176,64 @@ def evaluate(
         )
 
     return coverage, mae, sharpness, exceedance_count
+
+
+def alert(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    tolerance: float = 0.0,
+) -> tuple[
+    list[int],
+    list[tuple[float, int]],
+    list[float],
+]:
+    """Raise alert levels from per-timestep prediction residual scores.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed`` (values may be negative).
+    uncertainty: K x N matrix with the same shape as ``observed``; each
+        value must additionally be finite and >= 0.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative alert thresholds.
+    tolerance: non-bool finite int or float >= 0 (default 0.0).
+
+    Returns ``(levels, evidence, scores)``, three plain lists of length
+    K in time (row) order. For each time ``t`` and receptor ``i``::
+
+        x[t][i] = max(abs(predicted[t][i] - observed[t][i])
+                      - tolerance - uncertainty[t][i], 0.0)
+        scores[t]   = fsum(x[t][i] for i in range(N))
+        evidence[t] = (scores[t], number of i with x[t][i] > 0)
+        levels[t]   = number of thresholds <= scores[t]   (0-3)
+
+    ``levels[t]`` is an int, ``evidence[t]`` a ``(float, int)`` pair and
+    ``scores[t]`` a float; nothing is rounded.
+    """
+    obs, pred, unc, tol = _validate_inputs(
+        observed, predicted, uncertainty, tolerance
+    )
+    alert_thresholds = _validate_thresholds(thresholds)
+
+    levels: list[int] = []
+    evidence: list[tuple[float, int]] = []
+    scores: list[float] = []
+    for t in range(len(obs)):
+        residuals = [
+            max(abs(pred[t][i] - obs[t][i]) - tol - unc[t][i], 0.0)
+            for i in range(len(obs[t]))
+        ]
+        score = math.fsum(residuals)
+        count = sum(1 for value in residuals if value > 0)
+        level = sum(1 for boundary in alert_thresholds if boundary <= score)
+        levels.append(level)
+        evidence.append((score, count))
+        scores.append(score)
+
+    return levels, evidence, scores
