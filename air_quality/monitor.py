@@ -15,6 +15,7 @@ __all__ = [
     "ewma",
     "interval_score",
     "persistence",
+    "standardized_error",
     "summarize",
 ]
 
@@ -86,6 +87,18 @@ def _validate_drift(drift: object) -> float:
     _check_finite("drift", value)
     if value < 0:
         raise ValueError(f"drift must be >= 0, got {value!r}")
+    return value
+
+
+def _validate_floor(floor: object) -> float:
+    if not _is_number(floor):
+        raise TypeError(
+            f"floor must be an int or float, got {type(floor).__name__}"
+        )
+    value = float(floor)
+    _check_finite("floor", value)
+    if value <= 0:
+        raise ValueError(f"floor must be > 0, got {value!r}")
     return value
 
 
@@ -694,3 +707,78 @@ def persistence(
         qualifying_runs.append(column_qualifying)
 
     return longest, first_start, qualifying_runs
+
+
+def standardized_error(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    floor: float = 1e-12,
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    """Uncertainty-standardized prediction errors per receptor.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    floor: non-bool finite int or float strictly greater than 0
+        (default 1e-12); lower bound applied to each uncertainty when
+        standardizing.
+
+    Returns ``(mean, peak, coverage, weighted)``, plain lists of length
+    N in receptor order, where for each time ``t`` and receptor ``i``::
+
+        e[t][i] = abs(predicted[t][i] - observed[t][i])
+        d[t][i] = e[t][i] / max(uncertainty[t][i], floor)
+        W = fsum(t + 1 for t in range(K))
+        mean[i] = fsum(d[t][i] for t) / K
+        peak[i] = max(d[t][i] for t)
+        coverage[i] = sum(d[t][i] <= 1 for t) / K
+        weighted[i] = fsum((t + 1) * d[t][i] for t) / W
+
+    All results are floats and are not rounded.
+    """
+    obs = _validate_matrix("observed", observed, allow_negative=True)
+    pred = _validate_matrix("predicted", predicted, allow_negative=True)
+    unc = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    floor_value = _validate_floor(floor)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    for name, matrix in (("predicted", pred), ("uncertainty", unc)):
+        if len(matrix) != n_rows:
+            raise ValueError(
+                f"observed and {name} must have the same number of rows, "
+                f"got {n_rows} and {len(matrix)}"
+            )
+        for t, row in enumerate(matrix):
+            if len(row) != n_receptors:
+                raise ValueError(
+                    f"{name}[{t}] must have {n_receptors} elements, "
+                    f"got {len(row)}"
+                )
+
+    weights_total = math.fsum(t + 1 for t in range(n_rows))
+    mean: list[float] = []
+    peak: list[float] = []
+    coverage: list[float] = []
+    weighted: list[float] = []
+    for i in range(n_receptors):
+        column = [
+            abs(pred[t][i] - obs[t][i]) / max(unc[t][i], floor_value)
+            for t in range(n_rows)
+        ]
+        mean.append(math.fsum(column) / n_rows)
+        peak.append(max(column))
+        coverage.append(sum(1 for value in column if value <= 1) / n_rows)
+        weighted.append(
+            math.fsum((t + 1) * column[t] for t in range(n_rows))
+            / weights_total
+        )
+
+    return mean, peak, coverage, weighted
