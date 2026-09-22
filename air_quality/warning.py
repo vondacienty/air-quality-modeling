@@ -6,7 +6,14 @@ import math
 
 from .gaussian import _check_finite, _is_number, _validate_scalar
 
-__all__ = ["assess", "forecast", "forecast_interval", "aggregate", "risk_interval"]
+__all__ = [
+    "assess",
+    "forecast",
+    "forecast_interval",
+    "aggregate",
+    "risk_interval",
+    "window",
+]
 
 
 def _validate_matrix(
@@ -614,3 +621,119 @@ def risk_interval(
     ]
 
     return pl, ph, low_scores, high_scores
+
+
+def window(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    z: float = 1.96,
+    minimum: int = 1,
+) -> tuple[list[int], int, int, int]:
+    """Locate sustained maximum-level warning windows over time.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    z: non-bool, finite int or float >= 0 giving the confidence
+        multiplier (default 1.96).
+    minimum: non-bool int >= 1 giving the minimum run length that
+        qualifies as a window (default 1).
+
+    For each time ``t`` and receptor ``i``::
+
+        H[t] = fsum(population[i] * beta
+                    * (values[t][i] + z * uncertainty[t][i])
+                    for i in range(N))
+        level[t] = number of thresholds <= H[t]   (0-3)
+        x[t] = (level[t] == 3)
+
+    Consecutive ``True`` values of ``x`` form runs (segments) along the
+    time axis.
+
+    Returns ``(levels, longest, first_start, qualifying_runs)`` where
+    ``levels`` is a K-long plain list of ints in time order; ``longest``
+    is the length of the longest run of ``True`` values (0 when there is
+    no run); ``first_start`` is the smallest start index among the
+    longest runs (-1 when there is no run); ``qualifying_runs`` is the
+    number of runs whose length is >= ``minimum``. All three summary
+    values are ints and results are not rounded.
+    """
+    val_matrix = _validate_matrix("values", values, allow_negative=False)
+    unc_matrix = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    if len(unc_matrix) != len(val_matrix):
+        raise ValueError(
+            f"values and uncertainty must have the same number of rows, "
+            f"got {len(val_matrix)} and {len(unc_matrix)}"
+        )
+    n_receptors = len(val_matrix[0])
+    for t, row in enumerate(unc_matrix):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"uncertainty[{t}] must have {n_receptors} elements, "
+                f"got {len(row)}"
+            )
+
+    populations = _validate_vector("population", population, n_receptors)
+    beta_value = _validate_scalar("beta", beta)
+    if beta_value < 0:
+        raise ValueError(f"beta must be >= 0, got {beta_value!r}")
+    levels_thresholds = _validate_thresholds(thresholds)
+    z_value = _validate_scalar("z", z)
+    if z_value < 0:
+        raise ValueError(f"z must be >= 0, got {z_value!r}")
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    levels: list[int] = []
+    for t in range(len(val_matrix)):
+        high_score = math.fsum(
+            populations[i] * beta_value
+            * (val_matrix[t][i] + z_value * unc_matrix[t][i])
+            for i in range(n_receptors)
+        )
+        levels.append(
+            sum(1 for t_value in levels_thresholds if t_value <= high_score)
+        )
+
+    longest = 0
+    first_start = -1
+    qualifying_runs = 0
+    run_length = 0
+    run_start = -1
+    for t, level in enumerate(levels):
+        if level == 3:
+            if run_length == 0:
+                run_start = t
+            run_length += 1
+        else:
+            if run_length > 0:
+                if run_length >= minimum:
+                    qualifying_runs += 1
+                if run_length > longest:
+                    longest = run_length
+                    first_start = run_start
+            run_length = 0
+            run_start = -1
+    if run_length > 0:
+        if run_length >= minimum:
+            qualifying_runs += 1
+        if run_length > longest:
+            longest = run_length
+            first_start = run_start
+
+    return levels, longest, first_start, qualifying_runs
