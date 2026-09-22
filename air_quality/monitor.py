@@ -13,6 +13,7 @@ __all__ = [
     "cusum",
     "evaluate",
     "ewma",
+    "interval_score",
     "persistence",
     "summarize",
 ]
@@ -49,6 +50,18 @@ def _validate_alpha(alpha: object) -> float:
     _check_finite("alpha", value)
     if not 0.0 < value <= 1.0:
         raise ValueError(f"alpha must be in (0, 1], got {value!r}")
+    return value
+
+
+def _validate_interval_alpha(alpha: object) -> float:
+    if not _is_number(alpha):
+        raise TypeError(
+            f"alpha must be an int or float, got {type(alpha).__name__}"
+        )
+    value = float(alpha)
+    _check_finite("alpha", value)
+    if not 0.0 < value < 1.0:
+        raise ValueError(f"alpha must be in (0, 1), got {value!r}")
     return value
 
 
@@ -230,6 +243,95 @@ def evaluate(
         )
 
     return coverage, mae, sharpness, exceedance_count
+
+
+def interval_score(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    alpha: float = 0.1,
+) -> tuple[list[float], list[float], list[float]]:
+    """Score prediction intervals against observations per receptor.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    alpha: non-bool finite int or float strictly between 0 and 1
+        (default 0.1); penalty weight for observations outside the
+        interval.
+
+    Writing ``lo[t][i] = predicted[t][i] - uncertainty[t][i]``,
+    ``hi[t][i] = predicted[t][i] + uncertainty[t][i]`` and
+    ``r[t][i] = observed[t][i]``, returns ``(coverage, width, score)``,
+    plain lists of length N in receptor order:
+
+    * ``coverage[i] = sum(lo[t][i] <= r[t][i] <= hi[t][i] for t) / K``,
+    * ``width[i] = fsum(hi[t][i] - lo[t][i] for t) / K``,
+    * ``score[i] = fsum(s[t][i] for t) / K`` where
+      ``s[t][i] = (hi[t][i] - lo[t][i]) + 2 / alpha * (lo[t][i] -
+      r[t][i])`` when ``r[t][i] < lo[t][i]``,
+      ``s[t][i] = (hi[t][i] - lo[t][i]) + 2 / alpha * (r[t][i] -
+      hi[t][i])`` when ``r[t][i] > hi[t][i]`` and
+      ``s[t][i] = hi[t][i] - lo[t][i]`` otherwise.
+
+    All results are floats and are not rounded.
+    """
+    obs = _validate_matrix("observed", observed, allow_negative=True)
+    pred = _validate_matrix("predicted", predicted, allow_negative=True)
+    unc = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    alpha_value = _validate_interval_alpha(alpha)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    for name, matrix in (("predicted", pred), ("uncertainty", unc)):
+        if len(matrix) != n_rows:
+            raise ValueError(
+                f"observed and {name} must have the same number of rows, "
+                f"got {n_rows} and {len(matrix)}"
+            )
+        for t, row in enumerate(matrix):
+            if len(row) != n_receptors:
+                raise ValueError(
+                    f"{name}[{t}] must have {n_receptors} elements, "
+                    f"got {len(row)}"
+                )
+
+    two_over_alpha = 2.0 / alpha_value
+    coverage: list[float] = []
+    width: list[float] = []
+    score: list[float] = []
+    for i in range(n_receptors):
+        inside = 0
+        widths: list[float] = []
+        scores: list[float] = []
+        for t in range(n_rows):
+            low = pred[t][i] - unc[t][i]
+            high = pred[t][i] + unc[t][i]
+            real = obs[t][i]
+            interval_width = high - low
+            widths.append(interval_width)
+            if real < low:
+                scores.append(
+                    interval_width + two_over_alpha * (low - real)
+                )
+            elif real > high:
+                scores.append(
+                    interval_width + two_over_alpha * (real - high)
+                )
+            else:
+                inside += 1
+                scores.append(interval_width)
+        coverage.append(inside / n_rows)
+        width.append(math.fsum(widths) / n_rows)
+        score.append(math.fsum(scores) / n_rows)
+
+    return coverage, width, score
 
 
 def alert(
