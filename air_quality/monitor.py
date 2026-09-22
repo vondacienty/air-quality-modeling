@@ -7,7 +7,7 @@ import math
 from .gaussian import _check_finite, _is_number
 from .warning import _validate_matrix, _validate_thresholds
 
-__all__ = ["alert", "compare", "evaluate", "ewma", "summarize"]
+__all__ = ["alert", "compare", "cusum", "evaluate", "ewma", "summarize"]
 
 
 def _validate_tolerance(tolerance: object) -> float:
@@ -43,6 +43,18 @@ def _validate_ewma_threshold(threshold: object) -> float:
     _check_finite("threshold", value)
     if value < 0:
         raise ValueError(f"threshold must be >= 0, got {value!r}")
+    return value
+
+
+def _validate_drift(drift: object) -> float:
+    if not _is_number(drift):
+        raise TypeError(
+            f"drift must be an int or float, got {type(drift).__name__}"
+        )
+    value = float(drift)
+    _check_finite("drift", value)
+    if value < 0:
+        raise ValueError(f"drift must be >= 0, got {value!r}")
     return value
 
 
@@ -322,6 +334,82 @@ def ewma(
         for t in range(n_rows):
             x = max(abs(pred[t][i] - obs[t][i]) - tol - unc[t][i], 0.0)
             current = alpha_value * x + one_minus_alpha * previous
+            if current > peak_value:
+                peak_value = current
+            if current >= threshold_value:
+                if first_index < 0:
+                    first_index = t
+                trigger_count += 1
+            previous = current
+        final.append(previous)
+        peak.append(peak_value)
+        first.append(first_index)
+        triggered.append(trigger_count)
+
+    return final, peak, first, triggered
+
+
+def cusum(
+    observed: list[list[float]] | tuple[tuple[float, ...], ...],
+    predicted: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    drift: float,
+    threshold: float,
+    tolerance: float = 0.0,
+) -> tuple[list[float], list[float], list[int], list[int]]:
+    """Cumulative sums of prediction errors with a drift allowance.
+
+    observed: non-empty time x receptor (K x N) matrix of observed
+        concentrations; both the outer container and each row must be a
+        list or tuple, rows must be non-empty and share one receptor
+        count; each value a finite non-bool int or float (may be
+        negative).
+    predicted: matrix of predicted concentrations with the same shape
+        and constraints as ``observed``.
+    uncertainty: matrix of prediction uncertainties with the same shape
+        as ``observed``; each value must additionally be >= 0.
+    drift: non-bool finite int or float >= 0; amount subtracted from the
+        cumulative sum at each time step.
+    threshold: non-bool finite int or float >= 0; a cumulative-sum level
+        at or above it counts as a trigger.
+    tolerance: non-bool finite int or float >= 0 (default 0.0); absolute
+        errors up to ``tolerance + uncertainty[t][i]`` are disregarded.
+
+    Returns ``(final, peak, first, triggered)``, plain lists of length N
+    in receptor order, where for each time ``t`` and receptor ``i``::
+
+        x[t][i] = max(abs(predicted[t][i] - observed[t][i])
+                      - tolerance - uncertainty[t][i], 0.0)
+        s[-1][i] = 0.0
+        s[t][i] = max(0.0, s[t - 1][i] + x[t][i] - drift)
+        final[i] = s[K - 1][i]
+        peak[i] = max(s[t][i] for t in range(K))
+        first[i] = smallest t with s[t][i] >= threshold, else -1
+        triggered[i] = number of rows with s[t][i] >= threshold
+
+    ``final`` and ``peak`` are floats; ``first`` and ``triggered`` are
+    ints; results are not rounded.
+    """
+    obs, pred, unc, tol = _validate_inputs(
+        observed, predicted, uncertainty, tolerance
+    )
+    drift_value = _validate_drift(drift)
+    threshold_value = _validate_ewma_threshold(threshold)
+
+    n_rows = len(obs)
+    n_receptors = len(obs[0])
+    final: list[float] = []
+    peak: list[float] = []
+    first: list[int] = []
+    triggered: list[int] = []
+    for i in range(n_receptors):
+        previous = 0.0
+        peak_value = 0.0
+        first_index = -1
+        trigger_count = 0
+        for t in range(n_rows):
+            x = max(abs(pred[t][i] - obs[t][i]) - tol - unc[t][i], 0.0)
+            current = max(0.0, previous + x - drift_value)
             if current > peak_value:
                 peak_value = current
             if current >= threshold_value:
