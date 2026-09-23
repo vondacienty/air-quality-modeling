@@ -16,6 +16,7 @@ __all__ = [
     "transition",
     "exceedance_probability",
     "level_probability",
+    "alert_run",
     "quantile",
 ]
 
@@ -1010,6 +1011,75 @@ def level_probability(
         alert_probability.append(row[3])
 
     return probabilities, expected_level, alert_probability
+
+
+def alert_run(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    minimum: int = 1,
+) -> tuple[list[float], list[float], float]:
+    """Probability of a sustained run of maximum-level alerts over time.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    minimum: non-bool int >= 1 giving the run length ``m`` that qualifies
+        as a sustained alert (default 1).
+
+    The per-time probability of the highest warning level is taken
+    strictly as the third return value of
+    ``level_probability(values, uncertainty, population, beta,
+    thresholds)``; call it ``q[t]``. Times are independent. Maintaining
+    the state ``s`` of current run lengths 0..m-1 with
+    ``s = [1] + [0] * (m - 1)`` initially, for each time ``t``::
+
+        first[t] = s[m - 1] * q[t]
+        new[0] = fsum(s[r] * (1 - q[t]) for r in 0..m-1)
+        new[r + 1] = s[r] * q[t]            for r < m - 1
+        s = new
+
+    Returns ``(q, first, p_any)`` where ``q`` and ``first`` are K-long
+    plain lists of floats in time order and ``p_any`` is a float.
+    ``first[t]`` is the probability that a run of ``m`` consecutive
+    alerts completes for the first time at time ``t`` (absorbing state),
+    and ``p_any = 1 - fsum(s)`` is the probability of at least one such
+    run within the K times. Results are not rounded.
+    """
+    _, _, q = level_probability(
+        values, uncertainty, population, beta, thresholds
+    )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    m = minimum
+    s = [1.0] + [0.0] * (m - 1)
+    first: list[float] = []
+    for qt in q:
+        first.append(s[m - 1] * qt)
+        new = [math.fsum(s[r] * (1.0 - qt) for r in range(m))]
+        for r in range(m - 1):
+            new.append(s[r] * qt)
+        s = new
+
+    p_any = 1.0 - math.fsum(s)
+
+    return q, first, p_any
 
 
 def _validate_quantiles(quantiles: object) -> list[float]:
