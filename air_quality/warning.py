@@ -13,6 +13,7 @@ __all__ = [
     "aggregate",
     "risk_interval",
     "window",
+    "exceedance_probability",
 ]
 
 
@@ -737,3 +738,91 @@ def window(
             first_start = run_start
 
     return levels, longest, first_start, qualifying_runs
+
+
+def exceedance_probability(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+) -> tuple[list[list[float]], list[float]]:
+    """Gaussian exceedance probabilities of warning thresholds over time.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+
+    For each time ``t`` and receptor ``i`` the population-weighted impact
+    is modeled as a Gaussian with::
+
+        mu[t] = fsum(population[i] * beta * values[t][i] for i in range(N))
+        sigma[t] = hypot(*(population[i] * beta * uncertainty[t][i]
+                           for i in range(N)))
+
+    and for each threshold index ``j`` in 0..2::
+
+        p[t][j] = 0.5 * erfc((thresholds[j] - mu[t])
+                             / (sigma[t] * sqrt(2)))   if sigma[t] > 0
+        p[t][j] = 1.0 if thresholds[j] <= mu[t] else 0.0
+                                                      if sigma[t] == 0
+
+    Returns ``(p, expected)`` where ``p`` is a K x 3 plain list of lists
+    of floats in time order and ``expected`` is a K-long plain list of
+    floats with ``expected[t] = fsum(p[t])``. Results are not rounded.
+    """
+    val_matrix = _validate_matrix("values", values, allow_negative=False)
+    unc_matrix = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    if len(unc_matrix) != len(val_matrix):
+        raise ValueError(
+            f"values and uncertainty must have the same number of rows, "
+            f"got {len(val_matrix)} and {len(unc_matrix)}"
+        )
+    n_receptors = len(val_matrix[0])
+    for t, row in enumerate(unc_matrix):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"uncertainty[{t}] must have {n_receptors} elements, "
+                f"got {len(row)}"
+            )
+
+    populations = _validate_vector("population", population, n_receptors)
+    beta_value = _validate_scalar("beta", beta)
+    if beta_value < 0:
+        raise ValueError(f"beta must be >= 0, got {beta_value!r}")
+    levels_thresholds = _validate_thresholds(thresholds)
+
+    p: list[list[float]] = []
+    expected: list[float] = []
+    for t in range(len(val_matrix)):
+        mu = math.fsum(
+            populations[i] * beta_value * val_matrix[t][i]
+            for i in range(n_receptors)
+        )
+        sigma = math.hypot(
+            *(populations[i] * beta_value * unc_matrix[t][i]
+              for i in range(n_receptors))
+        )
+        row: list[float] = []
+        for j in range(3):
+            if sigma > 0:
+                row.append(
+                    0.5
+                    * math.erfc(
+                        (levels_thresholds[j] - mu) / (sigma * math.sqrt(2))
+                    )
+                )
+            else:
+                row.append(1.0 if levels_thresholds[j] <= mu else 0.0)
+        p.append(row)
+        expected.append(math.fsum(row))
+
+    return p, expected
