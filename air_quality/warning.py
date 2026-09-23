@@ -21,6 +21,7 @@ __all__ = [
     "alert_run_distribution",
     "alert_run_profile",
     "alert_level_runs",
+    "alert_level_distribution",
 ]
 
 
@@ -1552,3 +1553,115 @@ def alert_level_runs(
         )
 
     return q, first, cumulative, expected_runs
+
+
+def alert_level_distribution(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    minimum: int = 1,
+) -> tuple[list[list[float]], list[list[float]], list[float]]:
+    """Distribution of completed runs of consecutive alerts for each level.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    minimum: non-bool int >= 1 giving the required run length of
+        consecutive alerts (default 1).
+
+    ``p`` is exactly the first item (``probabilities``) returned by
+    ``level_probability(values, uncertainty, population, beta,
+    thresholds)``: ``p[t][j]`` is the probability that the level at time
+    ``t`` is exactly level ``j`` (levels 0..3). For each threshold index
+    ``j`` in 1..3 the alert event "level at least ``j``" at time ``t`` is
+    treated as an independent Bernoulli event with probability::
+
+        q[t][j - 1] = fsum(p[t][j:])
+
+    Writing ``m = minimum``, the state ``(r, c)`` (one distribution per
+    threshold level) tracks the current run length ``r`` of consecutive
+    alerts truncated to ``m`` and the count ``c`` of completed qualifying
+    runs; the initial state is ``P(0, 0) = 1``. For each time ``t``:
+
+        alert (probability q[t][j - 1]):
+            (r, c) -> (r + 1, c + [r + 1 == m])   if r < m
+            (r, c) -> (r, c)                       if r == m
+        no alert (probability 1 - q[t][j - 1]):
+            (r, c) -> (0, c)
+
+    Contributions to each target state are combined with ``math.fsum``
+    over source states in ascending ``(r, c)`` order.
+
+    Returns ``(q, distribution, expected_runs)`` where ``q`` is a K x 3
+    plain list of lists of floats in time order (one column per threshold
+    level); ``distribution`` is a 3 x (K + 1) plain list of lists of
+    floats with ``distribution[j - 1][c]`` the probability of completing
+    exactly ``c`` qualifying runs within the horizon, and
+    ``expected_runs`` is a 3-long plain list of floats with
+    ``expected_runs[j - 1] = fsum(c * distribution[j - 1][c] for c in
+    range(K + 1))``. Results are not rounded.
+    """
+    p, _, _ = level_probability(
+        values, uncertainty, population, beta, thresholds
+    )
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    m = minimum
+    k_times = len(p)
+    q: list[list[float]] = [
+        [math.fsum(p_t[j:]) for j in (1, 2, 3)] for p_t in p
+    ]
+
+    distribution: list[list[float]] = []
+    expected_runs: list[float] = []
+    for j in range(3):
+        state: dict[tuple[int, int], float] = {(0, 0): 1.0}
+        for t in range(k_times):
+            q_t = q[t][j]
+            contributions: dict[tuple[int, int], list[float]] = {}
+            for r, c in sorted(state):
+                p_state = state[(r, c)]
+                key = (0, c)
+                contributions.setdefault(key, []).append(
+                    p_state * (1.0 - q_t)
+                )
+                if r < m:
+                    key = (r + 1, c + 1 if r + 1 == m else c)
+                else:
+                    key = (r, c)
+                contributions.setdefault(key, []).append(p_state * q_t)
+            state = {
+                key: math.fsum(contribs)
+                for key, contribs in sorted(contributions.items())
+            }
+
+        grouped: dict[int, list[float]] = {}
+        for (_, c), p_state in sorted(state.items()):
+            grouped.setdefault(c, []).append(p_state)
+        level_distribution = [0.0] * (k_times + 1)
+        for c, contribs in grouped.items():
+            level_distribution[c] = math.fsum(contribs)
+        distribution.append(level_distribution)
+        expected_runs.append(
+            math.fsum(
+                c * level_distribution[c] for c in range(k_times + 1)
+            )
+        )
+
+    return q, distribution, expected_runs
