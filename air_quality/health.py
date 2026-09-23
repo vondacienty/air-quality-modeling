@@ -6,7 +6,7 @@ import math
 
 from .gaussian import _check_finite, _is_number
 
-__all__ = ["aggregate", "assess"]
+__all__ = ["aggregate", "assess", "exceedance_probability"]
 
 
 def _validate_matrix(
@@ -271,3 +271,89 @@ def aggregate(
     total_spread = math.hypot(*R)
 
     return M, R, lower, upper, total, total_spread
+
+
+def exceedance_probability(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+) -> tuple[list[list[float]], list[float]]:
+    """Compute exceedance probabilities of scenario impacts against thresholds.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    Returns ``(probabilities, expected)`` where, with
+    ``mu[k] = fsum(H[k])`` and ``sigma[k] = hypot(*W[k])``:
+
+    * ``probabilities[k][j]`` is the probability that the total impact of
+      scenario ``k`` exceeds ``thresholds[j]``:
+      ``0.5 * erfc((thresholds[j] - mu[k]) / (sigma[k] * sqrt(2)))`` when
+      ``sigma[k] > 0``, otherwise ``1.0`` if ``thresholds[j] <= mu[k]``
+      else ``0.0``;
+    * ``expected[k] = fsum(probabilities[k])``.
+
+    ``probabilities`` is a K x 3 list of lists of floats and ``expected``
+    is a K-long list of floats, in input order and unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    probabilities: list[list[float]] = []
+    for k in range(len(impacts)):
+        mu = math.fsum(impacts[k])
+        sigma = math.hypot(*uncertainties[k])
+        row: list[float] = []
+        for level in levels:
+            if sigma > 0:
+                row.append(0.5 * math.erfc((level - mu) / (sigma * math.sqrt(2))))
+            else:
+                row.append(1.0 if level <= mu else 0.0)
+        probabilities.append(row)
+
+    expected = [math.fsum(row) for row in probabilities]
+
+    return probabilities, expected
