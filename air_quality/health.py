@@ -6,7 +6,13 @@ import math
 
 from .gaussian import _check_finite, _is_number
 
-__all__ = ["aggregate", "assess", "exceedance_probability", "risk_probability"]
+__all__ = [
+    "aggregate",
+    "assess",
+    "exceedance_probability",
+    "level_probability",
+    "risk_probability",
+]
 
 
 def _validate_matrix(
@@ -481,3 +487,131 @@ def risk_probability(
     expected = math.fsum(probabilities)
 
     return probabilities, expected
+
+
+def level_probability(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+) -> tuple[list[float], float, float]:
+    """Aggregate health-level probabilities across scenarios.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    Returns ``(probabilities, expected_level, alert_probability)`` where,
+    with ``mu[k] = fsum(H[k])`` and ``sigma[k] = hypot(*W[k])``:
+
+    * ``q[k][j] = 0.5 * erfc((thresholds[j] - mu[k]) / (sigma[k] * sqrt(2)))``
+      when ``sigma[k] > 0``, otherwise ``1.0`` if
+      ``thresholds[j] <= mu[k]`` else ``0.0``;
+    * ``p[k] = [1 - q0, q0 - q1, q1 - q2, q2]`` holds the probabilities
+      of the four health levels for scenario ``k``;
+    * ``probabilities[j] = fsum(w[k] * p[k][j] for k in range(K))``;
+    * ``expected_level = fsum(j * probabilities[j] for j in range(4))``;
+    * ``alert_probability = probabilities[3]``.
+
+    ``probabilities`` is a 4-long list of floats and ``expected_level``
+    and ``alert_probability`` are floats, all unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    if weights is None:
+        w = [1.0 / n_scenarios] * n_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != n_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {n_scenarios}, "
+                f"got {len(weights)}"
+            )
+        raw = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            raw.append(value)
+        total_weight = math.fsum(raw)
+        if total_weight <= 0:
+            raise ValueError(f"weights sum must be > 0, got {total_weight!r}")
+        w = [value / total_weight for value in raw]
+
+    per_scenario: list[list[float]] = []
+    for k in range(n_scenarios):
+        mu = math.fsum(impacts[k])
+        sigma = math.hypot(*uncertainties[k])
+        q: list[float] = []
+        for level in levels:
+            if sigma > 0:
+                q.append(0.5 * math.erfc((level - mu) / (sigma * math.sqrt(2))))
+            else:
+                q.append(1.0 if level <= mu else 0.0)
+        per_scenario.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
+
+    probabilities = [
+        math.fsum(w[k] * per_scenario[k][j] for k in range(n_scenarios))
+        for j in range(4)
+    ]
+    expected_level = math.fsum(j * probabilities[j] for j in range(4))
+    alert_probability = probabilities[3]
+
+    return probabilities, expected_level, alert_probability
