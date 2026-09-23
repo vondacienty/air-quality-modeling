@@ -13,6 +13,7 @@ __all__ = [
     "level_probability",
     "quantile",
     "receptor_level_probability",
+    "receptor_quantile",
     "risk_interval",
     "risk_probability",
 ]
@@ -1006,5 +1007,157 @@ def quantile(
         Q.append(float(mus[chosen]))
         L.append(float(lowers[chosen]))
         U.append(float(uppers[chosen]))
+
+    return Q, L, U
+
+
+def receptor_quantile(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    quantiles: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
+    """Weighted per-receptor quantiles of scenario health impacts.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    quantiles: non-empty list or tuple of finite numbers, each in
+        ``[0, 1]`` and in non-decreasing order.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    Returns ``(Q, L, U)`` where, for each receptor ``i`` and scenario
+    ``k``:
+
+    * ``v[k] = H[k][i]``, ``l[k] = H[k][i] - z * W[k][i]``,
+      ``u[k] = H[k][i] + z * W[k][i]``;
+    * for each requested quantile ``q`` the scenarios are sorted by
+      ``(value, k)`` ascending for each of the three value sets and the
+      quantile scenario is the first one whose cumulative normalized
+      weight is ``>= q`` (the first scenario in that order when
+      ``q == 0``);
+    * ``Q[j][i]``, ``L[j][i]`` and ``U[j][i]`` hold that scenario's
+      ``v``, ``l`` and ``u`` values respectively.
+
+    Each result is an M x N list of lists of floats, in ``quantiles``
+    then receptor order, unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(quantiles, (list, tuple)):
+        raise TypeError(
+            f"quantiles must be a list or tuple, got {type(quantiles).__name__}"
+        )
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must not be empty")
+    qs: list[float] = []
+    for j, item in enumerate(quantiles):
+        if not _is_number(item):
+            raise TypeError(
+                f"quantiles[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"quantiles[{j}]", value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"quantiles[{j}] must be in [0, 1], got {value!r}")
+        if j > 0 and value < qs[j - 1]:
+            raise ValueError(
+                f"quantiles must be non-decreasing, got {[*qs, value]!r}"
+            )
+        qs.append(value)
+
+    if weights is None:
+        w = [1.0 / n_scenarios] * n_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != n_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {n_scenarios}, "
+                f"got {len(weights)}"
+            )
+        raw = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            raw.append(value)
+        total_weight = math.fsum(raw)
+        if total_weight <= 0:
+            raise ValueError(f"weights sum must be > 0, got {total_weight!r}")
+        w = [value / total_weight for value in raw]
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    Q: list[list[float]] = [[0.0] * n_receptors for _ in qs]
+    L: list[list[float]] = [[0.0] * n_receptors for _ in qs]
+    U: list[list[float]] = [[0.0] * n_receptors for _ in qs]
+
+    for i in range(n_receptors):
+        values = [impacts[k][i] for k in range(n_scenarios)]
+        lowers = [values[k] - z * uncertainties[k][i] for k in range(n_scenarios)]
+        uppers = [values[k] + z * uncertainties[k][i] for k in range(n_scenarios)]
+
+        orders = [
+            sorted(range(n_scenarios), key=lambda k, src=src: (src[k], k))
+            for src in (values, lowers, uppers)
+        ]
+        chosen_per_q: list[tuple[int, int, int]] = []
+        for q in qs:
+            picks = []
+            for order in orders:
+                if q == 0.0:
+                    chosen = order[0]
+                else:
+                    cumulative = 0.0
+                    chosen = order[-1]
+                    for k in order:
+                        cumulative = math.fsum([cumulative, w[k]])
+                        if cumulative >= q:
+                            chosen = k
+                            break
+                picks.append(chosen)
+            chosen_per_q.append((picks[0], picks[1], picks[2]))
+
+        for j, (qk, lk, uk) in enumerate(chosen_per_q):
+            Q[j][i] = float(values[qk])
+            L[j][i] = float(lowers[lk])
+            U[j][i] = float(uppers[uk])
 
     return Q, L, U
