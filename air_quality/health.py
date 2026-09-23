@@ -8,6 +8,7 @@ from .gaussian import _check_finite, _is_number
 
 __all__ = [
     "aggregate",
+    "aggregate_correlated",
     "assess",
     "exceedance_probability",
     "level_probability",
@@ -78,6 +79,58 @@ def _validate_vector(name: str, values: object, expected_length: int) -> list[fl
         if value < 0:
             raise ValueError(f"{name}[{i}] must be >= 0, got {value!r}")
         validated.append(value)
+    return validated
+
+
+def _validate_cube(name: str, cube: object) -> list[list[list[float]]]:
+    if not isinstance(cube, (list, tuple)):
+        raise TypeError(f"{name} must be a list or tuple, got {type(cube).__name__}")
+    if len(cube) == 0:
+        raise ValueError(f"{name} must not be empty")
+    width: int | None = None
+    validated = []
+    for k, matrix in enumerate(cube):
+        if not isinstance(matrix, (list, tuple)):
+            raise TypeError(
+                f"{name}[{k}] must be a list or tuple, got {type(matrix).__name__}"
+            )
+        if len(matrix) == 0:
+            raise ValueError(f"{name}[{k}] must not be empty")
+        if width is None:
+            width = len(matrix)
+        elif len(matrix) != width:
+            raise ValueError(
+                f"{name}[{k}] must have {width} rows, got {len(matrix)}"
+            )
+        rows = []
+        for i, row in enumerate(matrix):
+            if not isinstance(row, (list, tuple)):
+                raise TypeError(
+                    f"{name}[{k}][{i}] must be a list or tuple, "
+                    f"got {type(row).__name__}"
+                )
+            if len(row) != width:
+                raise ValueError(
+                    f"{name}[{k}][{i}] must have {width} elements, "
+                    f"got {len(row)}"
+                )
+            values = []
+            for j, item in enumerate(row):
+                if not _is_number(item):
+                    raise TypeError(
+                        f"{name}[{k}][{i}][{j}] must be an int or float, "
+                        f"got {type(item).__name__}"
+                    )
+                value = float(item)
+                _check_finite(f"{name}[{k}][{i}][{j}]", value)
+                if j > i and value != 0.0:
+                    raise ValueError(
+                        f"{name}[{k}][{i}][{j}] must be 0 above the diagonal, "
+                        f"got {value!r}"
+                    )
+                values.append(value)
+            rows.append(values)
+        validated.append(rows)
     return validated
 
 
@@ -279,6 +332,140 @@ def aggregate(
     upper = [M[i] + R[i] for i in range(n_receptors)]
     total = math.fsum(M)
     total_spread = math.hypot(*R)
+
+    return M, R, lower, upper, total, total_spread
+
+
+def aggregate_correlated(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    F: list[list[list[float]]] | tuple[tuple[tuple[float, ...], ...], ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[list[float], list[float], list[float], list[float], float, float]:
+    """Aggregate scenario health impacts with correlated receptor errors.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    F: K x N x N array of lower-triangular factor matrices, one per
+        scenario; each container level must be a list or tuple, every
+        matrix must be non-empty, square and share one receptor count with
+        ``H``; each value must be finite and entries above the diagonal
+        must be exactly 0.
+    weights: ``None`` (the default) or a list or tuple with one finite,
+        non-negative entry per scenario. With ``None`` every scenario has
+        weight ``1 / K``; otherwise the weights are normalized by their
+        positive sum.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    Returns ``(M, R, lower, upper, T, total_spread)`` where, with
+    ``Sigma[k][i][j] = fsum(F[k][i][r] * F[k][j][r] for r in range(N))``:
+
+    * ``M[i] = fsum(w[k] * H[k][i])``,
+    * ``V[i] = fsum(w[k] * ((H[k][i] - M[i]) ** 2 + Sigma[k][i][i]))``,
+    * ``R[i] = z * sqrt(V[i])``,
+    * ``lower[i] = M[i] - R[i]``, ``upper[i] = M[i] + R[i]``,
+    * ``T = fsum(M)``,
+    * ``VT = fsum(w[k] * ((fsum(H[k]) - T) ** 2
+      + fsum(Sigma[k][i][j] for i in range(N) for j in range(N))))``,
+    * ``total_spread = z * sqrt(VT)``.
+
+    The first four results are plain N-long lists of floats and the last
+    two are floats, all unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    factors = _validate_cube("F", F)
+
+    if len(factors) != len(impacts):
+        raise ValueError(
+            f"H and F must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(factors)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, matrix in enumerate(factors):
+        if len(matrix) != n_receptors:
+            raise ValueError(
+                f"F[{k}] must have {n_receptors} rows, got {len(matrix)}"
+            )
+
+    if weights is None:
+        w = [1.0 / n_scenarios] * n_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != n_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {n_scenarios}, "
+                f"got {len(weights)}"
+            )
+        raw = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            raw.append(value)
+        total_weight = math.fsum(raw)
+        if total_weight <= 0:
+            raise ValueError(f"weights sum must be > 0, got {total_weight!r}")
+        w = [value / total_weight for value in raw]
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    covariances: list[list[list[float]]] = []
+    for k in range(n_scenarios):
+        matrix = factors[k]
+        sigma = [
+            [
+                math.fsum(matrix[i][r] * matrix[j][r] for r in range(n_receptors))
+                for j in range(n_receptors)
+            ]
+            for i in range(n_receptors)
+        ]
+        covariances.append(sigma)
+
+    M: list[float] = []
+    V: list[float] = []
+    for i in range(n_receptors):
+        mean = math.fsum(w[k] * impacts[k][i] for k in range(n_scenarios))
+        variance = math.fsum(
+            w[k] * ((impacts[k][i] - mean) ** 2 + covariances[k][i][i])
+            for k in range(n_scenarios)
+        )
+        M.append(mean)
+        V.append(variance)
+
+    R = [z * math.sqrt(variance) for variance in V]
+    lower = [M[i] - R[i] for i in range(n_receptors)]
+    upper = [M[i] + R[i] for i in range(n_receptors)]
+    total = math.fsum(M)
+    total_variance = math.fsum(
+        w[k]
+        * (
+            (math.fsum(impacts[k]) - total) ** 2
+            + math.fsum(
+                covariances[k][i][j]
+                for i in range(n_receptors)
+                for j in range(n_receptors)
+            )
+        )
+        for k in range(n_scenarios)
+    )
+    total_spread = z * math.sqrt(total_variance)
 
     return M, R, lower, upper, total, total_spread
 
