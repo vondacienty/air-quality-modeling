@@ -19,6 +19,7 @@ __all__ = [
     "quantile",
     "alert_run",
     "alert_run_distribution",
+    "alert_run_profile",
 ]
 
 
@@ -1328,3 +1329,106 @@ def alert_run_distribution(
     )
 
     return q, distribution, expected_runs
+
+
+def alert_run_profile(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    minimum: int = 1,
+) -> tuple[list[float], list[float], float, list[float], list[float]]:
+    """Timing profile of completed runs of consecutive top-level alerts.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    minimum: non-bool int >= 1 giving the required run length of
+        consecutive top-level alerts (default 1).
+
+    ``q`` is exactly the third item (``alert_probability``) returned by
+    ``level_probability(values, uncertainty, population, beta,
+    thresholds)``, i.e. for each time ``t`` the probability that the
+    highest warning level is reached. The alert at time ``t`` is treated
+    as an independent Bernoulli(``q[t]``) event. Writing ``m = minimum``,
+    the state ``(r, c)`` tracks the current run length ``r`` of
+    consecutive alerts truncated to ``m`` and the count ``c`` of
+    completed qualifying runs; the initial state is ``P(0, 0) = 1``. For
+    each time ``t``::
+
+        alert (probability q[t]):
+            (r, c) -> (r + 1, c + (1 if r + 1 == m else 0))   if r < m
+            (r, c) -> (r, c)                                   if r == m
+        no alert (probability 1 - q[t]):
+            (r, c) -> (0, c)
+
+    Contributions to each destination state are merged with
+    ``math.fsum``, visiting the source states in ascending ``(r, c)``
+    order. ``first[t]`` is the probability that a qualifying run is first
+    completed exactly at time ``t`` (mass transitioning from ``r = m - 1``
+    on an alert) and ``cumulative_any[t] = fsum(first[: t + 1])`` is the
+    probability that at least one qualifying run has been completed by
+    time ``t``.
+
+    Returns ``(q, distribution, expected_runs, first, cumulative_any)``
+    where ``q``, ``first`` and ``cumulative_any`` are K-long plain lists
+    of floats in time order; ``distribution`` is a (K + 1)-long plain
+    list of floats with ``distribution[c]`` the probability of completing
+    exactly ``c`` qualifying runs within the horizon; and
+    ``expected_runs`` is the float ``fsum(c * distribution[c] for c in
+    range(K + 1))``. Results are not rounded.
+    """
+    _, _, q = level_probability(values, uncertainty, population, beta, thresholds)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    m = minimum
+    k_times = len(q)
+    state: dict[tuple[int, int], float] = {(0, 0): 1.0}
+    first: list[float] = []
+    for q_t in q:
+        contributions: dict[tuple[int, int], list[float]] = {}
+        first_terms: list[float] = []
+        for (r, c), p in sorted(state.items()):
+            key = (0, c)
+            contributions.setdefault(key, []).append(p * (1.0 - q_t))
+            if r < m:
+                completes = r + 1 == m
+                key = (r + 1, c + 1 if completes else c)
+                if completes and c == 0:
+                    first_terms.append(p * q_t)
+            else:
+                key = (r, c)
+            contributions.setdefault(key, []).append(p * q_t)
+        state = {
+            key: math.fsum(parts) for key, parts in contributions.items()
+        }
+        first.append(math.fsum(first_terms))
+
+    cumulative_any = [
+        math.fsum(first[: t + 1]) for t in range(k_times)
+    ]
+
+    distribution = [
+        math.fsum(p for (_, c), p in sorted(state.items()) if c == c_value)
+        for c_value in range(k_times + 1)
+    ]
+    expected_runs = math.fsum(
+        c * distribution[c] for c in range(k_times + 1)
+    )
+
+    return q, distribution, expected_runs, first, cumulative_any
