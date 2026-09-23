@@ -1,8 +1,6 @@
 ## 用途
 
-本项目是「大气污染扩散反演与溯源平台」的代码仓库，用于逐步实现该方向的建模与数据处理能力。
-
-当前处于基线状态：只有项目骨架，尚未实现任何业务算法。
+本项目是「大气污染扩散反演与溯源平台」的代码仓库，用于该方向的建模与数据处理，目前已提供高斯烟羽扩散、情景健康影响评估与风险聚合等算法。
 
 ## 环境与安装
 
@@ -18,7 +16,7 @@ python -m pip install -e .
 python -m pytest
 ```
 
-基线尚无测试用例，收集到 0 个用例属预期结果。
+当前尚无测试用例，收集到 0 个用例属预期结果。
 
 ## 命令行入口
 
@@ -33,8 +31,22 @@ air-quality-modeling --help     # 打印用法
 
 - 命令行程序 `air-quality-modeling`
 - Python 包 `air_quality`，其 `__version__` 为当前版本号
-
-## 限制
-
-- 除版本查询外没有其他功能。
-- 输入输出格式、数据来源与算法均尚未定义。
+- 包根公开函数：`persistence`、`forecast`、`forecast_interval`、`aggregate`
+- 健康影响评估模块 `air_quality.health`（通过 `air_quality.health.xxx` 调用，不在包根导出），提供以下函数：
+  - `assess(C, U, P, beta, baseline=0)`：评估各情景相对基线情景的健康影响，返回 `(H, S, W, Q)`
+  - `aggregate(H, W, weights=None, z=1.96)`：跨情景聚合各受体健康影响及区间，返回 `(M, R, lower, upper, total, total_spread)`
+  - `aggregate_correlated(H, F, weights=None, z=1.96)`：考虑受体误差相关时的跨情景聚合
+  - `exceedance_probability(H, W, thresholds)`：各情景总影响超过各级阈值的概率
+  - `risk_probability(H, W, thresholds, weights=None)`：跨情景加权聚合的超标风险概率
+  - `risk_interval(H, W, thresholds, weights=None, z=1.96)`：跨情景聚合影响区间与超标风险
+  - `level_probability(H, W, thresholds, weights=None)`：跨情景加权聚合的健康等级概率
+  - `receptor_level_probability(H, W, thresholds)`：分受体的健康等级概率
+  - `quantile(H, W, quantiles, weights=None, z=1.96)`：情景总健康影响的加权分位数及区间
+  - `receptor_quantile(H, W, quantiles, weights=None, z=1.96)`：分受体的加权分位数及区间
+  - `sensitivity(H, W, weights=None, z=1.96)`：各受体加权均值、区间半宽及各情景的均值/方差敏感性贡献。`H`、`W` 为同形 K×N 矩阵（`H` 元素可负，`W` 元素非负）；`weights` 为 `None`（取等权 `1/K`）或按 `fsum` 归一的 K 个非负权；`z` 为非负区间倍数。返回 `(M, R, C, S)`，其中
+    `M[i] = fsum(w[k]*H[k][i])`、
+    `R[i] = z*sqrt(V[i])`、
+    `C[k][i] = w[k]*(H[k][i]-M[i])`、
+    `V[i] = fsum(w[k]*((H[k][i]-M[i])**2 + W[k][i]**2))`，
+    `S[k][i]` 在 `V[i]==0` 时为 `0.0`，否则为 `w[k]*W[k][i]**2/V[i]`；
+    `M`、`R` 为 N 长 `list[float]`，`C`、`S` 为 K×N `list[list[float]]`，均不舍入。
