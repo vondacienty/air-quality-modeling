@@ -18,6 +18,7 @@ __all__ = [
     "level_probability",
     "quantile",
     "alert_run",
+    "alert_run_distribution",
 ]
 
 
@@ -1245,3 +1246,94 @@ def alert_run(
     p_any = 1.0 - math.fsum(s)
 
     return q, first, p_any
+
+
+def alert_run_distribution(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    minimum: int = 1,
+) -> tuple[list[float], list[float], float]:
+    """Distribution of the number of qualifying consecutive-alert runs.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    minimum: non-bool int >= 1 giving the required run length of
+        consecutive top-level alerts that qualifies as a segment
+        (default 1).
+
+    ``q`` is exactly the third item (``alert_probability``) returned by
+    ``level_probability(values, uncertainty, population, beta,
+    thresholds)``, i.e. for each time ``t`` the probability that the
+    highest warning level is reached. Each time is treated as an
+    independent Bernoulli trial with probability ``q[t]``.
+
+    Writing ``m = minimum``, the recursion keeps state ``(r, c)`` where
+    ``r`` is the current consecutive-alert length capped at ``m`` and
+    ``c`` is the number of completed qualifying segments. Starting from
+    ``P(0, 0) = 1``, at each time ``t``:
+
+    * with probability ``q[t]`` (alert): if ``r < m`` move to
+      ``(r + 1, c)`` (and to ``(r + 1, c + 1)`` exactly when
+      ``r == m - 1``, i.e. the length rises from ``m - 1`` to ``m``);
+      if ``r == m`` stay at ``(m, c)``;
+    * with probability ``1 - q[t]`` (no alert) move to ``(0, c)``.
+
+    Returns ``(q, distribution, expected_runs)`` where ``q`` is a K-long
+    plain list of floats in time order; ``distribution`` is a K+1-long
+    plain list of floats with ``distribution[c]`` the probability of
+    exactly ``c`` completed qualifying segments; and
+    ``expected_runs = fsum(c * distribution[c] for c in 0..K)``.
+    Results are not rounded.
+    """
+    _, _, q = level_probability(values, uncertainty, population, beta, thresholds)
+
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    k = len(q)
+    m = minimum
+    # state[r][c] = P(run length capped at m == r, completed segments == c)
+    state = [[0.0] * (k + 1) for _ in range(m + 1)]
+    state[0][0] = 1.0
+    for t, q_t in enumerate(q):
+        new_state = [[0.0] * (k + 1) for _ in range(m + 1)]
+        for r in range(m + 1):
+            for c in range(t + 1):
+                p = state[r][c]
+                if p == 0.0:
+                    continue
+                new_state[0][c] += p * (1.0 - q_t)
+                if r < m:
+                    if r == m - 1:
+                        new_state[m][c + 1] += p * q_t
+                    else:
+                        new_state[r + 1][c] += p * q_t
+                else:
+                    new_state[m][c] += p * q_t
+        state = new_state
+
+    distribution = [
+        math.fsum(state[r][c] for r in range(m + 1))
+        for c in range(k + 1)
+    ]
+    expected_runs = math.fsum(
+        c * distribution[c] for c in range(k + 1)
+    )
+
+    return q, distribution, expected_runs
