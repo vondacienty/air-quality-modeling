@@ -15,6 +15,7 @@ __all__ = [
     "window",
     "exceedance_probability",
     "level_probability",
+    "quantile",
 ]
 
 
@@ -926,3 +927,171 @@ def level_probability(
         alert_probability.append(row[3])
 
     return probabilities, expected_level, alert_probability
+
+
+def _validate_quantiles(quantiles: object) -> list[float]:
+    if not isinstance(quantiles, (list, tuple)):
+        raise TypeError(
+            f"quantiles must be a list or tuple, got {type(quantiles).__name__}"
+        )
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must not be empty")
+    validated = []
+    for m, item in enumerate(quantiles):
+        if not _is_number(item):
+            raise TypeError(
+                f"quantiles[{m}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"quantiles[{m}]", value)
+        if value < 0 or value > 1:
+            raise ValueError(
+                f"quantiles[{m}] must be in [0, 1], got {value!r}"
+            )
+        if m > 0 and value < validated[m - 1]:
+            raise ValueError(
+                f"quantiles must be non-decreasing, got "
+                f"quantiles[{m - 1}]={validated[m - 1]!r} and "
+                f"quantiles[{m}]={value!r}"
+            )
+        validated.append(value)
+    return validated
+
+
+def _validate_weights(weights: object, k_scenarios: int) -> list[float]:
+    if weights is None:
+        return [1.0 / k_scenarios] * k_scenarios
+    if not isinstance(weights, (list, tuple)):
+        raise TypeError(
+            f"weights must be a list or tuple, got {type(weights).__name__}"
+        )
+    if len(weights) != k_scenarios:
+        raise ValueError(
+            f"weights length must equal scenario count {k_scenarios}, "
+            f"got {len(weights)}"
+        )
+    validated = []
+    for k, item in enumerate(weights):
+        if not _is_number(item):
+            raise TypeError(
+                f"weights[{k}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"weights[{k}]", value)
+        if value < 0:
+            raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+        validated.append(value)
+    weight_sum = math.fsum(validated)
+    if weight_sum <= 0:
+        raise ValueError(f"weights sum must be > 0, got {weight_sum!r}")
+    return [value / weight_sum for value in validated]
+
+
+def _weighted_quantile(
+    scores: list[float], weights: list[float], level: float
+) -> float:
+    order = sorted(range(len(scores)), key=lambda k: (scores[k], k))
+    ordered = [scores[k] for k in order]
+    if level == 0:
+        return ordered[0]
+    for j in range(len(ordered)):
+        cumulative = math.fsum(weights[order[i]] for i in range(j + 1))
+        if cumulative >= level:
+            return ordered[j]
+    return ordered[-1]
+
+
+def quantile(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    quantiles: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[list[float], list[float], list[float]]:
+    """Weighted quantiles of scenario means and uncertainty bands.
+
+    values: non-empty scenario x receptor (K x N) matrix of values; both
+        the outer container and each row must be a list or tuple, rows
+        must be non-empty and share one receptor count; each value finite
+        and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    quantiles: non-empty list or tuple of finite, non-bool numbers in
+        [0, 1] in non-decreasing order.
+    weights: ``None`` for equal weights (``w[k] = 1 / K``), or a list or
+        tuple of K finite, non-bool, non-negative numbers; their sum must
+        be > 0. Weights are normalized to sum to one.
+    z: non-bool, finite int or float >= 0 giving the band multiplier
+        (default 1.96).
+
+    For each scenario ``k`` and receptor ``i``::
+
+        mu[k] = fsum(population[i] * beta * values[k][i] for i in range(N))
+        sigma[k] = hypot(*(population[i] * beta * uncertainty[k][i]
+                          for i in range(N)))
+        l[k] = max(0.0, mu[k] - z * sigma[k])
+        h[k] = mu[k] + z * sigma[k]
+
+    Each of ``mu``, ``l`` and ``h`` is sorted ascending by ``(value, k)``
+    and defines a weighted empirical distribution with the normalized
+    weights. For a requested level ``q``, the quantile is the first item
+    whose cumulative normalized weight is >= q; for ``q == 0`` it is the
+    first item.
+
+    Returns ``(Q, L, H)``, three M-long plain lists of floats in the
+    order of ``quantiles``, where ``Q`` holds the quantiles of ``mu``,
+    ``L`` of ``l`` and ``H`` of ``h``. Results are not rounded.
+    """
+    val_matrix = _validate_matrix("values", values, allow_negative=False)
+    unc_matrix = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    if len(unc_matrix) != len(val_matrix):
+        raise ValueError(
+            f"values and uncertainty must have the same number of rows, "
+            f"got {len(val_matrix)} and {len(unc_matrix)}"
+        )
+    n_receptors = len(val_matrix[0])
+    for k, row in enumerate(unc_matrix):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"uncertainty[{k}] must have {n_receptors} elements, "
+                f"got {len(row)}"
+            )
+
+    populations = _validate_vector("population", population, n_receptors)
+    beta_value = _validate_scalar("beta", beta)
+    if beta_value < 0:
+        raise ValueError(f"beta must be >= 0, got {beta_value!r}")
+    levels = _validate_quantiles(quantiles)
+    w = _validate_weights(weights, len(val_matrix))
+    z_value = _validate_scalar("z", z)
+    if z_value < 0:
+        raise ValueError(f"z must be >= 0, got {z_value!r}")
+
+    mu: list[float] = []
+    low: list[float] = []
+    high: list[float] = []
+    for k in range(len(val_matrix)):
+        mean = math.fsum(
+            populations[i] * beta_value * val_matrix[k][i]
+            for i in range(n_receptors)
+        )
+        sigma = math.hypot(
+            *(populations[i] * beta_value * unc_matrix[k][i]
+              for i in range(n_receptors))
+        )
+        mu.append(mean)
+        low.append(max(0.0, mean - z_value * sigma))
+        high.append(mean + z_value * sigma)
+
+    q_values = [_weighted_quantile(mu, w, level) for level in levels]
+    l_values = [_weighted_quantile(low, w, level) for level in levels]
+    h_values = [_weighted_quantile(high, w, level) for level in levels]
+
+    return q_values, l_values, h_values
