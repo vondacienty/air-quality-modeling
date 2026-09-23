@@ -11,6 +11,7 @@ __all__ = [
     "assess",
     "exceedance_probability",
     "level_probability",
+    "quantile",
     "risk_interval",
     "risk_probability",
 ]
@@ -760,3 +761,137 @@ def level_probability(
     alert_probability = probabilities[3]
 
     return probabilities, expected_level, alert_probability
+
+
+def quantile(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    quantiles: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[list[float], list[float], list[float]]:
+    """Weighted quantiles of per-scenario total impacts and their intervals.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    quantiles: non-empty list or tuple of finite numbers in ``[0, 1]`` in
+        non-decreasing order.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    Returns ``(Q, L, U)`` where, with
+    ``mu[k] = fsum(H[k])`` and ``sigma[k] = hypot(*W[k])``:
+
+    * ``l[k] = mu[k] - z * sigma[k]``, ``u[k] = mu[k] + z * sigma[k]``;
+    * for each requested quantile ``q``, scenarios are sorted by
+      ``(value, k)`` ascending (by ``mu`` for ``Q``, by ``l`` for ``L``
+      and by ``u`` for ``U``); with ``q == 0`` the first scenario is
+      chosen, otherwise the first scenario whose cumulative normalized
+      weight is ``>= q``;
+    * the corresponding ``mu``, ``l`` and ``u`` values are collected.
+
+    All three results are M-long lists of floats in ``quantiles`` order,
+    unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(quantiles, (list, tuple)):
+        raise TypeError(
+            f"quantiles must be a list or tuple, got {type(quantiles).__name__}"
+        )
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must not be empty")
+    qs: list[float] = []
+    for j, item in enumerate(quantiles):
+        if not _is_number(item):
+            raise TypeError(
+                f"quantiles[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"quantiles[{j}]", value)
+        if not 0 <= value <= 1:
+            raise ValueError(f"quantiles[{j}] must be in [0, 1], got {value!r}")
+        qs.append(value)
+    for j in range(1, len(qs)):
+        if qs[j] < qs[j - 1]:
+            raise ValueError(f"quantiles must be non-decreasing, got {qs!r}")
+
+    if weights is None:
+        w = [1.0 / n_scenarios] * n_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != n_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {n_scenarios}, "
+                f"got {len(weights)}"
+            )
+        raw = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            raw.append(value)
+        total_weight = math.fsum(raw)
+        if total_weight <= 0:
+            raise ValueError(f"weights sum must be > 0, got {total_weight!r}")
+        w = [value / total_weight for value in raw]
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    mus = [math.fsum(row) for row in impacts]
+    sigmas = [math.hypot(*row) for row in uncertainties]
+    lowers = [mus[k] - z * sigmas[k] for k in range(n_scenarios)]
+    uppers = [mus[k] + z * sigmas[k] for k in range(n_scenarios)]
+
+    def select(values: list[float], q: float) -> float:
+        order = sorted(range(n_scenarios), key=lambda k: (values[k], k))
+        if q == 0:
+            return values[order[0]]
+        prefix: list[float] = []
+        for k in order:
+            prefix.append(w[k])
+            if math.fsum(prefix) >= q:
+                return values[k]
+        return values[order[-1]]
+
+    Q = [select(mus, q) for q in qs]
+    L = [select(lowers, q) for q in qs]
+    U = [select(uppers, q) for q in qs]
+
+    return Q, L, U
