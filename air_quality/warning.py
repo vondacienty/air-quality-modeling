@@ -22,6 +22,7 @@ __all__ = [
     "alert_run_profile",
     "alert_level_runs",
     "alert_level_distribution",
+    "alert_level_profile",
 ]
 
 
@@ -1663,3 +1664,158 @@ def alert_level_distribution(
         )
 
     return q, distribution, expected_runs
+
+
+def alert_level_profile(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    minimum: int = 1,
+) -> tuple[list[list[float]], list[list[list[float]]], list[list[float]]]:
+    """Time profile of completed-run distributions for each alert level.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    minimum: non-bool int >= 1 giving the required run length of
+        consecutive alerts (default 1).
+
+    For each time ``t`` and receptor ``i`` the population-weighted impact
+    is modeled as a Gaussian with::
+
+        mu[t] = fsum(population[i] * beta * values[t][i] for i in range(N))
+        sigma[t] = hypot(*(population[i] * beta * uncertainty[t][i]
+                          for i in range(N)))
+
+    and for each threshold index ``j`` in 0..2::
+
+        q[t][j] = 0.5 * erfc((thresholds[j] - mu[t])
+                             / (sigma[t] * sqrt(2)))   if sigma[t] > 0
+        q[t][j] = 1.0 if thresholds[j] <= mu[t] else 0.0
+                                                      if sigma[t] == 0
+
+    Each threshold's alert events are treated as independent Bernoulli
+    events across time. Writing ``m = minimum``, the state ``(r, c)``
+    tracks the current run length ``r`` of consecutive alerts truncated
+    to ``m`` and the count ``c`` of completed qualifying runs; the
+    initial state is ``P(0, 0) = 1``. For each time ``t``:
+
+        alert (probability q[t][j]):
+            (r, c) -> (r + 1, c + [r + 1 == m])   if r < m
+            (r, c) -> (r, c)                      if r == m
+        no alert (probability 1 - q[t][j]):
+            (r, c) -> (0, c)
+
+    Contributions to each target state are combined with ``math.fsum``
+    over source states in ascending ``(r, c)`` order.
+
+    Returns ``(q, D, E)`` where ``q`` is a K x 3 plain list of lists of
+    floats in time order (one column per threshold level); ``D`` is a
+    K x 3 x (K + 1) plain list of lists of lists of floats with
+    ``D[t][j][c]`` the probability, after time ``t``, of having completed
+    exactly ``c`` qualifying runs of level-``j``-or-higher alerts,
+    grouping state probabilities with ``math.fsum`` over ``r`` in
+    ascending order; and ``E`` is a K x 3 plain list of lists of floats
+    with ``E[t][j] = fsum(c * D[t][j][c] for c in range(K + 1))``.
+    Results are not rounded.
+    """
+    val_matrix = _validate_matrix("values", values, allow_negative=False)
+    unc_matrix = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    if len(unc_matrix) != len(val_matrix):
+        raise ValueError(
+            f"values and uncertainty must have the same number of rows, "
+            f"got {len(val_matrix)} and {len(unc_matrix)}"
+        )
+    n_receptors = len(val_matrix[0])
+    for t, row in enumerate(unc_matrix):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"uncertainty[{t}] must have {n_receptors} elements, "
+                f"got {len(row)}"
+            )
+
+    populations = _validate_vector("population", population, n_receptors)
+    beta_value = _validate_scalar("beta", beta)
+    if beta_value < 0:
+        raise ValueError(f"beta must be >= 0, got {beta_value!r}")
+    levels_thresholds = _validate_thresholds(thresholds)
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            f"minimum must be an int, got {type(minimum).__name__}"
+        )
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    m = minimum
+    k_times = len(val_matrix)
+
+    q: list[list[float]] = []
+    for t in range(k_times):
+        mu = math.fsum(
+            populations[i] * beta_value * val_matrix[t][i]
+            for i in range(n_receptors)
+        )
+        sigma = math.hypot(
+            *(populations[i] * beta_value * unc_matrix[t][i]
+              for i in range(n_receptors))
+        )
+        row: list[float] = []
+        for j in range(3):
+            if sigma > 0:
+                row.append(
+                    0.5
+                    * math.erfc(
+                        (levels_thresholds[j] - mu) / (sigma * math.sqrt(2))
+                    )
+                )
+            else:
+                row.append(1.0 if levels_thresholds[j] <= mu else 0.0)
+        q.append(row)
+
+    D: list[list[list[float]]] = [
+        [[0.0] * (k_times + 1) for _ in range(3)]
+        for _ in range(k_times)
+    ]
+    E: list[list[float]] = [[0.0] * 3 for _ in range(k_times)]
+    for j in range(3):
+        state: dict[tuple[int, int], float] = {(0, 0): 1.0}
+        for t in range(k_times):
+            q_t = q[t][j]
+            contributions: dict[tuple[int, int], list[float]] = {}
+            for r, c in sorted(state):
+                p_state = state[(r, c)]
+                key = (0, c)
+                contributions.setdefault(key, []).append(
+                    p_state * (1.0 - q_t)
+                )
+                if r < m:
+                    key = (r + 1, c + 1 if r + 1 == m else c)
+                else:
+                    key = (r, c)
+                contributions.setdefault(key, []).append(p_state * q_t)
+            state = {
+                key: math.fsum(contribs)
+                for key, contribs in sorted(contributions.items())
+            }
+            grouped: dict[int, list[float]] = {}
+            for (r, c), p_state in sorted(state.items()):
+                grouped.setdefault(c, []).append((r, p_state))
+            for c, entries in grouped.items():
+                D[t][j][c] = math.fsum(
+                    p_state for _, p_state in sorted(entries)
+                )
+            E[t][j] = math.fsum(
+                c * D[t][j][c] for c in range(k_times + 1)
+            )
+
+    return q, D, E
