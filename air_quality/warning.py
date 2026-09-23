@@ -13,6 +13,7 @@ __all__ = [
     "aggregate",
     "risk_interval",
     "window",
+    "transition",
     "exceedance_probability",
     "level_probability",
     "quantile",
@@ -740,6 +741,88 @@ def window(
             first_start = run_start
 
     return levels, longest, first_start, qualifying_runs
+
+
+def transition(
+    values: list[list[float]] | tuple[tuple[float, ...], ...],
+    uncertainty: list[list[float]] | tuple[tuple[float, ...], ...],
+    population: list[float] | tuple[float, ...],
+    beta: float,
+    thresholds: list[float] | tuple[float, ...],
+    z: float = 1.96,
+) -> tuple[list[int], int, int, int, int]:
+    """Count warning-level transitions over time under upper uncertainty.
+
+    values: non-empty time x receptor (K x N) matrix of forecast values;
+        both the outer container and each row must be a list or tuple,
+        rows must be non-empty and share one receptor count; each value
+        finite and >= 0.
+    uncertainty: K x N matrix with the same shape and constraints as
+        ``values``.
+    population: list or tuple of N finite, non-negative receptor
+        populations.
+    beta: finite, non-negative scaling factor.
+    thresholds: list or tuple of 3 strictly increasing, finite,
+        non-negative warning thresholds.
+    z: non-bool, finite int or float >= 0 giving the confidence
+        multiplier (default 1.96).
+
+    For each time ``t`` and receptor ``i``::
+
+        H[t] = fsum(population[i] * beta
+                    * (values[t][i] + z * uncertainty[t][i])
+                    for i in range(N))
+        level[t] = number of thresholds <= H[t]   (0-3)
+
+    Returns ``(levels, up, down, peak, peak_time)`` where ``levels`` is a
+    K-long plain list of ints in time order; ``up`` counts the times
+    ``t >= 1`` with ``level[t] > level[t - 1]`` and ``down`` counts those
+    with ``level[t] < level[t - 1]`` (both 0 when K == 1); ``peak`` is
+    ``max(levels)`` and ``peak_time`` is the smallest index at which
+    ``peak`` first occurs. All summary values are ints and results are not
+    rounded.
+    """
+    val_matrix = _validate_matrix("values", values, allow_negative=False)
+    unc_matrix = _validate_matrix("uncertainty", uncertainty, allow_negative=False)
+    if len(unc_matrix) != len(val_matrix):
+        raise ValueError(
+            f"values and uncertainty must have the same number of rows, "
+            f"got {len(val_matrix)} and {len(unc_matrix)}"
+        )
+    n_receptors = len(val_matrix[0])
+    for t, row in enumerate(unc_matrix):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"uncertainty[{t}] must have {n_receptors} elements, "
+                f"got {len(row)}"
+            )
+
+    populations = _validate_vector("population", population, n_receptors)
+    beta_value = _validate_scalar("beta", beta)
+    if beta_value < 0:
+        raise ValueError(f"beta must be >= 0, got {beta_value!r}")
+    levels_thresholds = _validate_thresholds(thresholds)
+    z_value = _validate_scalar("z", z)
+    if z_value < 0:
+        raise ValueError(f"z must be >= 0, got {z_value!r}")
+
+    levels: list[int] = []
+    for t in range(len(val_matrix)):
+        high_score = math.fsum(
+            populations[i] * beta_value
+            * (val_matrix[t][i] + z_value * unc_matrix[t][i])
+            for i in range(n_receptors)
+        )
+        levels.append(
+            sum(1 for t_value in levels_thresholds if t_value <= high_score)
+        )
+
+    up = sum(1 for t in range(1, len(levels)) if levels[t] > levels[t - 1])
+    down = sum(1 for t in range(1, len(levels)) if levels[t] < levels[t - 1])
+    peak = max(levels)
+    peak_time = levels.index(peak)
+
+    return levels, up, down, peak, peak_time
 
 
 def exceedance_probability(
