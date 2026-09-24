@@ -45,6 +45,7 @@ air-quality-modeling --help     # 打印用法
   - `receptor_level_probability(H, W, thresholds)`：分受体的健康等级概率
   - `receptor_expected_excess(H, W, thresholds, weights=None)`：分受体、跨情景加权的超标概率与期望超额，返回 N×3 的 `(probabilities, excess)`
   - `receptor_count_interval(H, W, thresholds, weights=None, z=1.96)`：假定同一情景内各受体误差独立时，超过各级阈值的受体数的跨情景加权均值与区间，返回阈值序 3 长 `list[float]` 的 `(mean, spread, lower, upper)`，其中 `lower=max(0, mean-spread)`、`upper=min(N, mean+spread)`，均不舍入
+  - `receptor_excess_interval(H, W, thresholds, weights=None, z=1.96)`：分受体、分阈值的期望超额的跨情景加权均值与区间。`H`、`W` 为同形 K×N 矩阵（`H` 元素可负，`W` 元素非负）；`thresholds` 为 3 个严格递增非负数；`weights` 为 `None`（取等权 `1/K`）或按 `fsum` 归一的 K 个非负权；`z` 为非负区间倍数。对 `μ=H[k][i]`、`σ=W[k][i]`、`t=thresholds[j]`：`σ>0` 时 `a=(t−μ)/σ`、`φ=exp(−a²/2)/sqrt(2π)`、`p=erfc(a/sqrt(2))/2`、`e=σφ+(μ−t)p`、`s=((μ−t)²+σ²)p+σ(μ−t)φ−e²`；`σ=0` 时 `e=max(μ−t,0)`、`s=0`。`M[i][j]=fsum(w[k]*e[k][i][j])`、`V[i][j]=fsum(w[k]*((e[k][i][j]−M[i][j])²+s[k][i][j]))`、`R=z*sqrt(V)`、`L=M−R`、`U=M+R`，返回 N×3 `list[list[float]]` 的 `(M, R, L, U)`，均不舍入
   - `quantile(H, W, quantiles, weights=None, z=1.96)`：情景总健康影响的加权分位数及区间
   - `receptor_quantile(H, W, quantiles, weights=None, z=1.96)`：分受体的加权分位数及区间
   - `receptor_risk_share(H, W, thresholds, weights=None)`：分情景、分受体的超标概率与期望超额占比，返回 K×N×3 的 `(PS, ES)`
