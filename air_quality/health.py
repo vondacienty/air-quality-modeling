@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 
 from .gaussian import _check_finite, _is_number
@@ -25,6 +26,7 @@ __all__ = [
     "receptor_excess_interval",
     "receptor_expected_excess",
     "receptor_level_probability",
+    "receptor_mitigation_plan",
     "receptor_quantile",
     "receptor_risk_interval",
     "receptor_risk_quantile",
@@ -3838,3 +3840,178 @@ def at_least_count_probability(
     ]
 
     return p
+
+
+def receptor_mitigation_plan(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    options: list[list[tuple[float, float]]]
+    | tuple[tuple[tuple[float, float], ...], ...],
+    budget: float,
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[
+    list[int],
+    float,
+    float,
+    tuple[
+        list[list[float]],
+        list[list[float]],
+        list[list[float]],
+        list[list[float]],
+    ],
+]:
+    """Cost-constrained receptor mitigation plan selection.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    options: list or tuple with one entry per receptor; each entry is a
+        non-empty list or tuple of ``(reduction, cost)`` pairs, each pair
+        a list or tuple of exactly 2 finite, non-negative numbers.
+    budget: maximum total mitigation cost; finite and >= 0.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    Every plan ``choice`` picks one option index per receptor (0-based);
+    with ``(r_i, c_i) = options[i][choice[i]]`` its total cost is
+    ``fsum(c_i for i in range(N))`` and plans whose total cost exceeds
+    ``budget`` are discarded. For a feasible plan, with
+    ``H'[k][i] = H[k][i] - r_i`` and
+    ``(M, R, L, U) = receptor_excess_interval(H', W, thresholds, weights, z)``:
+
+    * ``score = fsum(max(U[i][j], 0.0) for i in range(N) for j in range(3))``;
+    * ``trigger`` is the number of ``(i, j)`` pairs with ``L[i][j] > 0``.
+
+    The feasible plan minimizing ``(score, trigger, total_cost, choice)``
+    lexicographically is selected; if no plan fits the budget a
+    ``ValueError`` is raised.
+    Returns ``(choice, total_cost, score, interval)`` where ``choice`` is
+    an N-long list of ints, ``total_cost`` and ``score`` are floats and
+    ``interval`` is the ``(M, R, L, U)`` tuple of N x 3 lists of floats
+    returned by ``receptor_excess_interval`` for the selected plan, all
+    unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    n_receptors = len(impacts[0])
+
+    if not isinstance(options, (list, tuple)):
+        raise TypeError(
+            f"options must be a list or tuple, got {type(options).__name__}"
+        )
+    if len(options) != n_receptors:
+        raise ValueError(
+            f"options length must equal receptor count {n_receptors}, "
+            f"got {len(options)}"
+        )
+    reductions: list[list[float]] = []
+    costs: list[list[float]] = []
+    for i, entry in enumerate(options):
+        if not isinstance(entry, (list, tuple)):
+            raise TypeError(
+                f"options[{i}] must be a list or tuple, "
+                f"got {type(entry).__name__}"
+            )
+        if len(entry) == 0:
+            raise ValueError(f"options[{i}] must not be empty")
+        r_row: list[float] = []
+        c_row: list[float] = []
+        for m, item in enumerate(entry):
+            if not isinstance(item, (list, tuple)):
+                raise TypeError(
+                    f"options[{i}][{m}] must be a list or tuple, "
+                    f"got {type(item).__name__}"
+                )
+            if len(item) != 2:
+                raise ValueError(
+                    f"options[{i}][{m}] must be a (reduction, cost) pair, "
+                    f"got {len(item)} elements"
+                )
+            r, c = item
+            if not _is_number(r):
+                raise TypeError(
+                    f"options[{i}][{m}][0] must be an int or float, "
+                    f"got {type(r).__name__}"
+                )
+            r = float(r)
+            _check_finite(f"options[{i}][{m}][0]", r)
+            if r < 0:
+                raise ValueError(
+                    f"options[{i}][{m}][0] must be >= 0, got {r!r}"
+                )
+            if not _is_number(c):
+                raise TypeError(
+                    f"options[{i}][{m}][1] must be an int or float, "
+                    f"got {type(c).__name__}"
+                )
+            c = float(c)
+            _check_finite(f"options[{i}][{m}][1]", c)
+            if c < 0:
+                raise ValueError(
+                    f"options[{i}][{m}][1] must be >= 0, got {c!r}"
+                )
+            r_row.append(r)
+            c_row.append(c)
+        reductions.append(r_row)
+        costs.append(c_row)
+
+    if not _is_number(budget):
+        raise TypeError(
+            f"budget must be an int or float, got {type(budget).__name__}"
+        )
+    budget = float(budget)
+    _check_finite("budget", budget)
+    if budget < 0:
+        raise ValueError(f"budget must be >= 0, got {budget!r}")
+
+    receptor_excess_interval(H, W, thresholds, weights, z)
+
+    best_key: tuple[float, int, float, list[int]] | None = None
+    best_choice: list[int] | None = None
+    best_cost = 0.0
+    best_score = 0.0
+    best_interval: tuple[
+        list[list[float]],
+        list[list[float]],
+        list[list[float]],
+        list[list[float]],
+    ] | None = None
+    for choice in itertools.product(
+        *(range(len(costs[i])) for i in range(n_receptors))
+    ):
+        total_cost = math.fsum(costs[i][choice[i]] for i in range(n_receptors))
+        if total_cost > budget:
+            continue
+        reduced = [
+            [impacts[k][i] - reductions[i][choice[i]] for i in range(n_receptors)]
+            for k in range(len(impacts))
+        ]
+        interval = receptor_excess_interval(reduced, W, thresholds, weights, z)
+        lower, upper = interval[2], interval[3]
+        score = math.fsum(
+            max(upper[i][j], 0.0) for i in range(n_receptors) for j in range(3)
+        )
+        trigger = sum(
+            1 for i in range(n_receptors) for j in range(3) if lower[i][j] > 0
+        )
+        key = (score, trigger, total_cost, list(choice))
+        if best_key is None or key < best_key:
+            best_key = key
+            best_choice = list(choice)
+            best_cost = total_cost
+            best_score = score
+            best_interval = interval
+
+    if best_key is None:
+        raise ValueError(f"no mitigation plan within budget {budget!r}")
+
+    return best_choice, best_cost, best_score, best_interval
