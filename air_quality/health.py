@@ -27,6 +27,7 @@ __all__ = [
     "receptor_excess_warning",
     "receptor_expected_excess",
     "receptor_level_probability",
+    "receptor_mitigation_frontier",
     "receptor_mitigation_plan",
     "receptor_quantile",
     "receptor_risk_interval",
@@ -4066,3 +4067,199 @@ def receptor_mitigation_plan(
         raise ValueError(f"no mitigation combination fits the budget {budget!r}")
 
     return best_choice, best_total_cost, best_score, best_interval
+
+
+def receptor_mitigation_frontier(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    options: list | tuple,
+    budget: float,
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> list[
+    tuple[
+        list[int],
+        float,
+        float,
+        float,
+        int,
+        tuple[list[list[float]], list[list[float]], list[list[float]], list[list[float]]],
+    ]
+]:
+    """Non-dominated mitigation plans, one option per receptor, under budget.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    options: list or tuple of length N (one entry per receptor); each
+        ``options[i]`` must be a non-empty list or tuple of pairs, and each
+        pair must be a 2-element list or tuple ``(r, c)`` with ``r`` the
+        finite, non-negative reduction applied to receptor ``i`` and ``c``
+        the finite, non-negative cost of choosing that option.
+    budget: finite, non-negative total cost limit; only combinations whose
+        ``fsum`` of chosen costs does not exceed the budget are feasible.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    For every feasible choice ``choice`` of one option per receptor, with
+    ``(r_i, c_i) = options[i][choice[i]]`` and ``C = fsum(c_i for i in
+    range(N)) <= budget``, the reduced impact matrix ``H'`` has
+    ``H'[k][i] = H[k][i] - r_i`` and
+    ``(M, R, L, U) = receptor_excess_interval(H', W, thresholds, weights,
+    z)``. The plan is scored by
+    ``S = fsum(max(U[i][j], 0.0) for i in range(N) for j in range(3))``,
+    ``D = fsum(R[i][j] for i in range(N) for j in range(3))``,
+    ``G = sum(1 for i in range(N) for j in range(3) if L[i][j] > 0)`` and
+    the cost ``C``. A feasible plan is kept only when no other feasible
+    plan is component-wise no worse on ``(S, D, G, C)`` and strictly better
+    on at least one component.
+    Returns the non-dominated plans as a list of
+    ``(choice, C, S, D, G, (M, R, L, U))`` tuples sorted ascending by
+    ``(S, D, G, C, choice)`` in lexicographic order, where ``choice`` is an
+    N-long list of 0-based option indices and every numeric result is
+    unrounded. Raises ``ValueError`` when no combination fits the budget.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    n_receptors = len(impacts[0])
+
+    if not isinstance(options, (list, tuple)):
+        raise TypeError(
+            f"options must be a list or tuple, got {type(options).__name__}"
+        )
+    if len(options) != n_receptors:
+        raise ValueError(
+            f"options length must equal receptor count {n_receptors}, "
+            f"got {len(options)}"
+        )
+    reductions: list[list[float]] = []
+    costs: list[list[float]] = []
+    for i, group in enumerate(options):
+        if not isinstance(group, (list, tuple)):
+            raise TypeError(
+                f"options[{i}] must be a list or tuple, "
+                f"got {type(group).__name__}"
+            )
+        if len(group) == 0:
+            raise ValueError(f"options[{i}] must not be empty")
+        group_reductions: list[float] = []
+        group_costs: list[float] = []
+        for q, item in enumerate(group):
+            if not isinstance(item, (list, tuple)):
+                raise TypeError(
+                    f"options[{i}][{q}] must be a list or tuple, "
+                    f"got {type(item).__name__}"
+                )
+            if len(item) != 2:
+                raise ValueError(
+                    f"options[{i}][{q}] must have exactly 2 elements, "
+                    f"got {len(item)}"
+                )
+            r_raw, c_raw = item
+            if not _is_number(r_raw):
+                raise TypeError(
+                    f"options[{i}][{q}][0] must be an int or float, "
+                    f"got {type(r_raw).__name__}"
+                )
+            if not _is_number(c_raw):
+                raise TypeError(
+                    f"options[{i}][{q}][1] must be an int or float, "
+                    f"got {type(c_raw).__name__}"
+                )
+            r = float(r_raw)
+            c = float(c_raw)
+            _check_finite(f"options[{i}][{q}][0]", r)
+            _check_finite(f"options[{i}][{q}][1]", c)
+            if r < 0:
+                raise ValueError(
+                    f"options[{i}][{q}][0] must be >= 0, got {r!r}"
+                )
+            if c < 0:
+                raise ValueError(
+                    f"options[{i}][{q}][1] must be >= 0, got {c!r}"
+                )
+            group_reductions.append(r)
+            group_costs.append(c)
+        reductions.append(group_reductions)
+        costs.append(group_costs)
+
+    if not _is_number(budget):
+        raise TypeError(f"budget must be an int or float, got {type(budget).__name__}")
+    budget = float(budget)
+    _check_finite("budget", budget)
+    if budget < 0:
+        raise ValueError(f"budget must be >= 0, got {budget!r}")
+
+    # Validate W, thresholds, weights and z under the same contract as
+    # receptor_excess_interval before enumerating any combination.
+    receptor_excess_interval(impacts, W, thresholds, weights, z)
+
+    candidates: list[tuple[float, float, int, float, tuple[int, ...], tuple]] = []
+    for choice_tuple in product(*(range(len(group)) for group in costs)):
+        total_cost = math.fsum(
+            costs[i][choice_tuple[i]] for i in range(n_receptors)
+        )
+        if total_cost > budget:
+            continue
+        adjusted = [
+            [
+                impacts[k][i] - reductions[i][choice_tuple[i]]
+                for i in range(n_receptors)
+            ]
+            for k in range(len(impacts))
+        ]
+        M, R, L, U = receptor_excess_interval(
+            adjusted, W, thresholds, weights, z
+        )
+        score = math.fsum(
+            max(U[i][j], 0.0) for i in range(n_receptors) for j in range(3)
+        )
+        spread = math.fsum(
+            R[i][j] for i in range(n_receptors) for j in range(3)
+        )
+        triggers = sum(
+            1 for i in range(n_receptors) for j in range(3) if L[i][j] > 0
+        )
+        candidates.append(
+            (score, spread, triggers, total_cost, choice_tuple, (M, R, L, U))
+        )
+
+    if not candidates:
+        raise ValueError(f"no mitigation combination fits the budget {budget!r}")
+
+    nondominated: list[
+        tuple[float, float, int, float, tuple[int, ...], tuple]
+    ] = []
+    for candidate in candidates:
+        s, d, g, c_cost, _, _ = candidate
+        dominated = False
+        for other in candidates:
+            if other is candidate:
+                continue
+            os_, od, og, oc, _, _ = other
+            if (
+                os_ <= s
+                and od <= d
+                and og <= g
+                and oc <= c_cost
+                and (os_ < s or od < d or og < g or oc < c_cost)
+            ):
+                dominated = True
+                break
+        if not dominated:
+            nondominated.append(candidate)
+
+    nondominated.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
+
+    return [
+        (list(choice), c_cost, score, spread, triggers, interval)
+        for score, spread, triggers, c_cost, choice, interval in nondominated
+    ]
