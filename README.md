@@ -45,6 +45,7 @@ air-quality-modeling --help     # 打印用法
   - `receptor_level_probability(H, W, thresholds)`：分受体的健康等级概率
   - `receptor_expected_excess(H, W, thresholds, weights=None)`：分受体、跨情景加权的超标概率与期望超额，返回 N×3 的 `(probabilities, excess)`
   - `receptor_count_interval(H, W, thresholds, weights=None, z=1.96)`：假定同一情景内各受体误差独立时，超过各级阈值的受体数的跨情景加权均值与区间，返回阈值序 3 长 `list[float]` 的 `(mean, spread, lower, upper)`，其中 `lower=max(0, mean-spread)`、`upper=min(N, mean+spread)`，均不舍入
+  - `receptor_count_quantile(H, W, thresholds, quantiles, weights=None)`：假定同一情景内各受体误差独立时，超过各级阈值的受体数分布的加权分位数；`quantiles` 为非空、元素在 `[0,1]` 且非递减的 list/tuple；分位 0 取最小计数，否则取累计加权概率首次 `>= q` 的计数，返回阈值、分位序的 3×M `list[list[int]]`
   - `quantile(H, W, quantiles, weights=None, z=1.96)`：情景总健康影响的加权分位数及区间
   - `receptor_quantile(H, W, quantiles, weights=None, z=1.96)`：分受体的加权分位数及区间
   - `receptor_risk_share(H, W, thresholds, weights=None)`：分情景、分受体的超标概率与期望超额占比，返回 K×N×3 的 `(PS, ES)`
