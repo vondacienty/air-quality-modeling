@@ -36,6 +36,7 @@ air-quality-modeling --help     # 打印用法
   - `assess(C, U, P, beta, baseline=0)`：评估各情景相对基线情景的健康影响，返回 `(H, S, W, Q)`
   - `aggregate(H, W, weights=None, z=1.96)`：跨情景聚合各受体健康影响及区间，返回 `(M, R, lower, upper, total, total_spread)`
   - `aggregate_correlated(H, F, weights=None, z=1.96)`：考虑受体误差相关时的跨情景聚合
+  - `any_receptor_probability(H, W, thresholds, weights=None)`：假定同一情景内各受体误差独立时，至少一个受体超过各级阈值的跨情景加权概率，返回阈值序的 3 长 `list[float]`
   - `exceedance_probability(H, W, thresholds)`：各情景总影响超过各级阈值的概率
   - `risk_probability(H, W, thresholds, weights=None)`：跨情景加权聚合的超标风险概率
   - `risk_interval(H, W, thresholds, weights=None, z=1.96)`：跨情景聚合影响区间与超标风险
