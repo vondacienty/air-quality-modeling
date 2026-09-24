@@ -24,6 +24,7 @@ __all__ = [
     "receptor_count_quantile",
     "receptor_excess",
     "receptor_excess_interval",
+    "receptor_excess_warning",
     "receptor_expected_excess",
     "receptor_level_probability",
     "receptor_mitigation_plan",
@@ -2052,6 +2053,62 @@ def receptor_excess_interval(
         U.append(u_row)
 
     return M, R, L, U
+
+
+def receptor_excess_warning(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[
+    list[int],
+    list[float | None],
+    list[list[float]],
+    tuple[list[list[float]], list[list[float]]],
+]:
+    """Per-receptor warning levels derived from the expected-excess interval.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    With ``(M, R, L, U) = receptor_excess_interval(
+    H, W, thresholds, weights, z)``, returns
+    ``(levels, triggers, scores, interval)`` where, per receptor ``i``:
+
+    * ``levels[i]`` is the number of thresholds ``j`` with ``L[i][j] > 0``;
+    * ``triggers[i]`` is ``thresholds[levels[i] - 1]`` when
+      ``levels[i] > 0``, otherwise ``None``;
+    * ``scores`` is ``M``;
+    * ``interval`` is the pair ``(L, U)``.
+
+    ``levels`` is an N-long list of ints, ``triggers`` an N-long list of
+    floats or ``None``, ``scores`` an N x 3 list of lists of floats and
+    ``interval`` a 2-tuple of N x 3 lists of lists of floats, all in
+    receptor then threshold order and unrounded.
+    """
+    mean, _, lower, upper = receptor_excess_interval(
+        H, W, thresholds, weights, z
+    )
+
+    levels = [sum(1 for value in row if value > 0) for row in lower]
+    triggers = [
+        float(thresholds[level - 1]) if level > 0 else None
+        for level in levels
+    ]
+
+    return levels, triggers, mean, (lower, upper)
 
 
 def receptor_count_probability(
