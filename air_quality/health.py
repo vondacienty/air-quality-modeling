@@ -14,6 +14,7 @@ __all__ = [
     "at_least_count_probability",
     "exceedance_probability",
     "excess_interval",
+    "excess_warning",
     "expected_excess",
     "level_probability",
     "quantile",
@@ -995,6 +996,50 @@ def excess_interval(
     upper = [mean[j] + spread[j] for j in range(3)]
 
     return mean, spread, lower, upper
+
+
+def excess_warning(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[int, float | None, list[float], tuple[list[float], list[float]]]:
+    """Warn from the lower bounds of the expected-excess interval.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    Calls :func:`excess_interval` and returns ``(level, trigger, score,
+    interval)`` where ``(M, R, L, U) = excess_interval(...)``:
+
+    * ``level`` is the number of thresholds ``j`` for which ``L[j] > 0``;
+    * ``trigger`` is ``thresholds[level - 1]`` when ``level > 0``, else
+      ``None``;
+    * ``score = M``;
+    * ``interval = (L, U)``.
+
+    ``level`` is an int, ``trigger`` is a float or ``None``, ``score`` is
+    a 3-long list of floats and ``interval`` is a 2-tuple of such lists,
+    all in input order and unrounded.
+    """
+    mean, _spread, lower, upper = excess_interval(H, W, thresholds, weights, z)
+
+    level = sum(1 for bound in lower if bound > 0)
+    trigger = float(thresholds[level - 1]) if level > 0 else None
+
+    return level, trigger, mean, (lower, upper)
 
 
 def risk_contribution(
