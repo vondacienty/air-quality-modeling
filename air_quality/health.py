@@ -8327,6 +8327,315 @@ def policy_recommend(
     return rows
 
 
+def robust_policy_summary(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budget: float,
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    z: float = 1.96,
+) -> tuple[list[int], int, list[int], list[list], list[list], tuple]:
+    """Pick one mitigation plan and run policy robust across weight sets.
+
+    ``H``, ``W``, ``thresholds``, ``quantiles``, ``policies``, ``options``,
+    ``budget`` and ``z`` share the contract of :func:`policy_recommend`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim; in
+    particular ``K >= 2`` scenarios are required). ``weight_sets`` is a
+    non-empty L x K list or tuple matrix whose outer container and each
+    row are lists or tuples. Every entry must be a non-bool finite,
+    non-negative number; a wrong container or element type raises
+    ``TypeError``. An empty matrix or row, rows of unequal length, a row
+    length different from the scenario count ``K``, a non-finite or
+    negative entry, or a row whose ``fsum`` is zero raises
+    ``ValueError``. Each row is normalized by its ``fsum``.
+
+    Every feasible ``(choice, p)`` pair is enumerated: ``choice`` picks
+    one option per receptor with
+    ``fsum(options[i][choice[i]][1]) <= budget`` and ``p`` ranges over
+    the policy indices. For a feasible pair the reduced impact matrix
+    has ``H'[k][i] = H[k][i] - options[i][choice[i]][0]``. For each
+    weight row ``w`` the interval
+    ``(M, R, L, U) = receptor_excess_interval(H', W, thresholds, w, z)``
+    and the warning outcome
+    ``o = receptor_count_run_warning(H', W, thresholds, quantiles,
+    (d1, d2, d3), level, minimum_count)`` for policy ``p`` are computed,
+    giving ``S = fsum(max(U[i][j], 0))``, ``D = fsum(R[i][j])``,
+    ``G = sum(1 for L[i][j] > 0)``, ``C`` the total plan cost,
+    ``a = max(o[1])`` and ``s = fsum(o[4][K - 1])``.
+
+    Within each weight row every feasible pair receives a 0-based rank
+    (0 = best) after sorting ascending by
+    ``(S, D, G, C, -a, -s, choice, p)``; ``ranks`` holds the L ranks of
+    the winning pair. The winner minimizes
+    ``(max(ranks), fsum(ranks), choice, p)``.
+
+    Returns ``(choice, p, ranks, metrics, intervals, o)`` where
+    ``choice`` is an N-long list of ints, ``p`` is an int, ``ranks`` is
+    an L-long list of ints, ``metrics`` is an L-long list of
+    ``(S, D, G, C, a, s)`` tuples, ``intervals`` an L-long list of the
+    ``(M, R, L, U)`` interval tuples and ``o`` the winning policy's
+    ``(runs, levels, triggers, first, cumulative)`` tuple, all unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+
+    if not isinstance(options, (list, tuple)):
+        raise TypeError(
+            f"options must be a list or tuple, got {type(options).__name__}"
+        )
+    if len(options) != n_receptors:
+        raise ValueError(
+            f"options length must equal receptor count {n_receptors}, "
+            f"got {len(options)}"
+        )
+    reductions: list[list[float]] = []
+    costs: list[list[float]] = []
+    for i, group in enumerate(options):
+        if not isinstance(group, (list, tuple)):
+            raise TypeError(
+                f"options[{i}] must be a list or tuple, "
+                f"got {type(group).__name__}"
+            )
+        if len(group) == 0:
+            raise ValueError(f"options[{i}] must not be empty")
+        group_reductions: list[float] = []
+        group_costs: list[float] = []
+        for q, item in enumerate(group):
+            if not isinstance(item, (list, tuple)):
+                raise TypeError(
+                    f"options[{i}][{q}] must be a list or tuple, "
+                    f"got {type(item).__name__}"
+                )
+            if len(item) != 2:
+                raise ValueError(
+                    f"options[{i}][{q}] must have exactly 2 elements, "
+                    f"got {len(item)}"
+                )
+            r_raw, c_raw = item
+            if not _is_number(r_raw):
+                raise TypeError(
+                    f"options[{i}][{q}][0] must be an int or float, "
+                    f"got {type(r_raw).__name__}"
+                )
+            if not _is_number(c_raw):
+                raise TypeError(
+                    f"options[{i}][{q}][1] must be an int or float, "
+                    f"got {type(c_raw).__name__}"
+                )
+            r = float(r_raw)
+            c = float(c_raw)
+            _check_finite(f"options[{i}][{q}][0]", r)
+            _check_finite(f"options[{i}][{q}][1]", c)
+            if r < 0:
+                raise ValueError(
+                    f"options[{i}][{q}][0] must be >= 0, got {r!r}"
+                )
+            if c < 0:
+                raise ValueError(
+                    f"options[{i}][{q}][1] must be >= 0, got {c!r}"
+                )
+            group_reductions.append(r)
+            group_costs.append(c)
+        reductions.append(group_reductions)
+        costs.append(group_costs)
+
+    if not _is_number(budget):
+        raise TypeError(f"budget must be an int or float, got {type(budget).__name__}")
+    budget = float(budget)
+    _check_finite("budget", budget)
+    if budget < 0:
+        raise ValueError(f"budget must be >= 0, got {budget!r}")
+
+    # Validate W, thresholds, quantiles and policies under the shared
+    # policy_recommend contract (K >= 2 included) before enumerating.
+    receptor_count_run_policy_batch(
+        impacts, W, thresholds, quantiles, policies
+    )
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    if not isinstance(weight_sets, (list, tuple)):
+        raise TypeError(
+            "weight_sets must be a list or tuple, "
+            f"got {type(weight_sets).__name__}"
+        )
+    if len(weight_sets) == 0:
+        raise ValueError("weight_sets must not be empty")
+    normalized_weights: list[list[float]] = []
+    for ell, row in enumerate(weight_sets):
+        if not isinstance(row, (list, tuple)):
+            raise TypeError(
+                f"weight_sets[{ell}] must be a list or tuple, "
+                f"got {type(row).__name__}"
+            )
+        if len(row) == 0:
+            raise ValueError(f"weight_sets[{ell}] must not be empty")
+        if len(row) != n_scenarios:
+            raise ValueError(
+                f"weight_sets[{ell}] length must equal scenario count "
+                f"{n_scenarios}, got {len(row)}"
+            )
+        raw: list[float] = []
+        for k, item in enumerate(row):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weight_sets[{ell}][{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weight_sets[{ell}][{k}]", value)
+            if value < 0:
+                raise ValueError(
+                    f"weight_sets[{ell}][{k}] must be >= 0, got {value!r}"
+                )
+            raw.append(value)
+        total_weight = math.fsum(raw)
+        if total_weight <= 0:
+            raise ValueError(
+                f"weight_sets[{ell}] sum must be > 0, got {total_weight!r}"
+            )
+        normalized_weights.append([value / total_weight for value in raw])
+
+    feasible: list[tuple[tuple[int, ...], float]] = []
+    for choice_tuple in product(*(range(len(group)) for group in costs)):
+        total_cost = math.fsum(
+            costs[i][choice_tuple[i]] for i in range(n_receptors)
+        )
+        if total_cost <= budget:
+            feasible.append((choice_tuple, total_cost))
+
+    if not feasible:
+        raise ValueError(f"no mitigation combination fits the budget {budget!r}")
+
+    # Indexed by [ell][pair_index] -> (S, D, G, C, a, s, interval, o).
+    per_weight: list[list[tuple]] = []
+    for w in normalized_weights:
+        entries: list[tuple] = []
+        for choice_tuple, total_cost in feasible:
+            adjusted = [
+                [
+                    impacts[k][i] - reductions[i][choice_tuple[i]]
+                    for i in range(n_receptors)
+                ]
+                for k in range(n_scenarios)
+            ]
+            interval = receptor_excess_interval(
+                adjusted, W, thresholds, w, z
+            )
+            M, R, L, U = interval
+            excess = math.fsum(
+                max(U[i][j], 0.0) for i in range(n_receptors) for j in range(3)
+            )
+            spread = math.fsum(
+                R[i][j] for i in range(n_receptors) for j in range(3)
+            )
+            triggers = sum(
+                1 for i in range(n_receptors) for j in range(3) if L[i][j] > 0
+            )
+
+            pair_metrics: list[tuple] = []
+            for p, policy in enumerate(policies):
+                level, minimum_count, d1, d2, d3 = policy
+                o = receptor_count_run_warning(
+                    adjusted,
+                    W,
+                    thresholds,
+                    quantiles,
+                    (d1, d2, d3),
+                    level=level,
+                    minimum_count=minimum_count,
+                )
+                peak = max(o[1])
+                score = math.fsum(o[4][n_scenarios - 1])
+                pair_metrics.append(
+                    (excess, spread, triggers, total_cost, peak, score, o)
+                )
+            entries.append((choice_tuple, total_cost, interval, pair_metrics))
+        per_weight.append(entries)
+
+    n_policies = len(policies)
+    n_pairs = len(feasible)
+
+    # Ranks within each weight row over the flattened (choice, p) pairs,
+    # sorted ascending by (S, D, G, C, -a, -s, choice, p).
+    ranks_by_weight: list[list[int]] = []
+    for ell in range(len(normalized_weights)):
+        entries = per_weight[ell]
+        ordered = sorted(
+            range(n_pairs * n_policies),
+            key=lambda index: (
+                entries[index // n_policies][3][index % n_policies][0],
+                entries[index // n_policies][3][index % n_policies][1],
+                entries[index // n_policies][3][index % n_policies][2],
+                entries[index // n_policies][1],
+                -entries[index // n_policies][3][index % n_policies][4],
+                -entries[index // n_policies][3][index % n_policies][5],
+                entries[index // n_policies][0],
+                index % n_policies,
+            ),
+        )
+        ranks = [0] * (n_pairs * n_policies)
+        for rank, index in enumerate(ordered):
+            ranks[index] = rank
+        ranks_by_weight.append(ranks)
+
+    best_key = None
+    best_index = -1
+    for index in range(n_pairs * n_policies):
+        pair_ranks = [ranks_by_weight[ell][index] for ell in
+                      range(len(normalized_weights))]
+        choice_tuple = feasible[index // n_policies][0]
+        key = (
+            max(pair_ranks),
+            math.fsum(pair_ranks),
+            choice_tuple,
+            index % n_policies,
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best_index = index
+
+    best_pair = best_index // n_policies
+    best_policy = best_index % n_policies
+    best_choice_tuple, best_cost = feasible[best_pair]
+    best_ranks = [
+        ranks_by_weight[ell][best_index]
+        for ell in range(len(normalized_weights))
+    ]
+    best_metrics: list[tuple] = []
+    best_intervals: list[tuple] = []
+    for ell in range(len(normalized_weights)):
+        choice_tuple, total_cost, interval, pair_metrics = per_weight[ell][
+            best_pair
+        ]
+        excess, spread, triggers, cost, peak, score, _ = pair_metrics[
+            best_policy
+        ]
+        best_metrics.append(
+            (excess, spread, triggers, cost, peak, score)
+        )
+        best_intervals.append(interval)
+    best_o = per_weight[0][best_pair][3][best_policy][6]
+
+    return (
+        list(best_choice_tuple),
+        best_policy,
+        best_ranks,
+        best_metrics,
+        best_intervals,
+        best_o,
+    )
+
+
 def receptor_level_quantile(
     H: list[list[float]] | tuple[tuple[float, ...], ...],
     W: list[list[float]] | tuple[tuple[float, ...], ...],
