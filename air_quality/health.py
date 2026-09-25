@@ -48,6 +48,7 @@ __all__ = [
     "receptor_level_run_cvar",
     "receptor_level_run_distribution",
     "receptor_level_run_entropy",
+    "receptor_level_run_quantile",
     "receptor_level_run_stats",
     "receptor_level_transition",
     "receptor_mitigation_frontier",
@@ -7908,6 +7909,171 @@ def receptor_level_run_cvar(
                     terms.append(take * m)
                     remaining -= take
                 result[m_index][i][l] = math.fsum(terms) / (1.0 - quantile)
+
+    return result
+
+
+def receptor_level_run_quantile(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+) -> list[list[list[int]]]:
+    """Quantiles of the longest run of each health level.
+
+    Scenario errors are treated as independent and scenarios are folded in
+    their given order, independently for every receptor and level.
+
+    H: K x N (K > 0, N > 0) scenario x receptor matrix of health impacts;
+        both the outer container and each row must be a list or tuple, rows
+        must be non-empty and share one receptor count; each value a finite
+        non-bool int or float (negative values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value a
+        finite non-bool int or float and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-bool, non-negative,
+        strictly increasing numbers.
+    quantiles: non-empty list or tuple of finite non-bool numbers, each in
+        ``[0, 1)`` and in non-decreasing order.
+    With ``mu = H[k][i]`` and ``sigma = W[k][i]``:
+
+    * ``q[j] = 0.5 * erfc((thresholds[j] - mu) / (sigma * sqrt(2)))`` when
+      ``sigma > 0``, otherwise ``1.0`` if ``thresholds[j] <= mu`` else
+      ``0.0``;
+    * ``p[k][i] = [1 - q0, q0 - q1, q1 - q2, q2]`` holds the probabilities
+      of the four health levels for scenario ``k`` at receptor ``i``.
+
+    For each receptor ``i`` and level ``l`` a Markov recursion over states
+    ``(r, m)`` (current run length ``r`` and longest run seen so far ``m``)
+    starts from ``D[(0, 0)] = 1.0``. Scenarios are processed in ascending
+    ``k`` order; with state keys in lexicographic order, an ``l`` event with
+    probability ``p[k][i][l]`` moves to
+    ``(min(r + 1, K), max(m, r + 1))`` while any other event moves to
+    ``(0, m)``; probabilities landing on the same target state are combined
+    with ``math.fsum``. The terminal mass on each longest run is
+    ``G[m] = fsum(D[(r, m)] for r in 0..K)``. For quantile ``q = 0`` the
+    result is ``0``; otherwise it is the smallest ``m`` for which
+    ``fsum(G[r] for r in 0..m) >= q``.
+
+    Returns an M x N x 4 ``list[list[list[int]]]`` indexed by quantile
+    (in ``quantiles`` order), then receptor, then level, unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    if not isinstance(quantiles, (list, tuple)):
+        raise TypeError(
+            f"quantiles must be a list or tuple, got {type(quantiles).__name__}"
+        )
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must not be empty")
+    qs: list[float] = []
+    for m, item in enumerate(quantiles):
+        if not _is_number(item):
+            raise TypeError(
+                f"quantiles[{m}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"quantiles[{m}]", value)
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"quantiles[{m}] must be in [0, 1), got {value!r}")
+        if m > 0 and value < qs[m - 1]:
+            raise ValueError(
+                f"quantiles must be non-decreasing, got {[*qs, value]!r}"
+            )
+        qs.append(value)
+
+    per_scenario: list[list[list[float]]] = []
+    for k in range(n_scenarios):
+        rows: list[list[float]] = []
+        for i in range(n_receptors):
+            mu = impacts[k][i]
+            sigma = uncertainties[k][i]
+            q: list[float] = []
+            for level in levels:
+                if sigma > 0:
+                    q.append(0.5 * math.erfc((level - mu) / (sigma * math.sqrt(2))))
+                else:
+                    q.append(1.0 if level <= mu else 0.0)
+            rows.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
+        per_scenario.append(rows)
+
+    result: list[list[list[int]]] = [
+        [[0] * 4 for _ in range(n_receptors)] for _ in qs
+    ]
+    for i in range(n_receptors):
+        for l in range(4):
+            state: dict[tuple[int, int], float] = {(0, 0): 1.0}
+            for k in range(n_scenarios):
+                hit = per_scenario[k][i][l]
+                miss = 1.0 - hit
+                updated: dict[tuple[int, int], list[float]] = {}
+                for (r, m) in sorted(state):
+                    probability = state[(r, m)]
+                    hit_target = (min(r + 1, n_scenarios), max(m, r + 1))
+                    miss_target = (0, m)
+                    updated.setdefault(hit_target, []).append(probability * hit)
+                    updated.setdefault(miss_target, []).append(probability * miss)
+                state = {
+                    target: math.fsum(terms) for target, terms in updated.items()
+                }
+            longest_terms: list[list[float]] = [
+                [] for _ in range(n_scenarios + 1)
+            ]
+            for (r, m), probability in state.items():
+                longest_terms[m].append(probability)
+            G = [math.fsum(terms) for terms in longest_terms]
+            for m_index, quantile in enumerate(qs):
+                if quantile == 0.0:
+                    result[m_index][i][l] = 0
+                    continue
+                cumulative = 0.0
+                chosen = n_scenarios
+                for m in range(n_scenarios + 1):
+                    cumulative = math.fsum([cumulative, G[m]])
+                    if cumulative >= quantile:
+                        chosen = m
+                        break
+                result[m_index][i][l] = chosen
 
     return result
 
