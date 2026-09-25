@@ -26,6 +26,7 @@ __all__ = [
     "receptor_count_interval",
     "receptor_count_probability",
     "receptor_count_quantile",
+    "receptor_count_run_warning",
     "receptor_count_share",
     "receptor_excess",
     "receptor_excess_cvar",
@@ -5609,6 +5610,53 @@ def receptor_level_count_rise_distribution(
     ]
 
 
+def _count_run_event_probs(
+    impacts: list[list[float]],
+    uncertainties: list[list[float]],
+    levels: list[float],
+    level: int,
+    minimum_count: int,
+) -> list[float]:
+    """Per-scenario probabilities of the level-count event.
+
+    ``impacts`` and ``uncertainties`` are the validated K x N matrices and
+    ``levels`` the 3 validated threshold values. Returns the K-long list
+    ``a[k] = fsum(Ck[minimum_count:])`` where ``Ck`` is the PMF of the
+    number of receptors at ``level`` in scenario ``k``.
+    """
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+
+    per_scenario: list[list[list[float]]] = []
+    for k in range(n_scenarios):
+        rows: list[list[float]] = []
+        for i in range(n_receptors):
+            mu = impacts[k][i]
+            sigma = uncertainties[k][i]
+            q: list[float] = []
+            for threshold in levels:
+                if sigma > 0:
+                    q.append(0.5 * math.erfc((threshold - mu) / (sigma * math.sqrt(2))))
+                else:
+                    q.append(1.0 if threshold <= mu else 0.0)
+            rows.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
+        per_scenario.append(rows)
+
+    event_probs: list[float] = []
+    for k in range(n_scenarios):
+        d = [1.0] + [0.0] * n_receptors
+        for i in range(n_receptors):
+            p = per_scenario[k][i][level]
+            updated = [0.0] * (n_receptors + 1)
+            for r in range(n_receptors + 1):
+                updated[r] = math.fsum(
+                    (d[r] * (1.0 - p), d[r - 1] * p if r > 0 else 0.0)
+                )
+            d = updated
+        event_probs.append(math.fsum(d[minimum_count:]))
+    return event_probs
+
+
 def receptor_level_count_run_distribution(
     H: list[list[float]] | tuple[tuple[float, ...], ...],
     W: list[list[float]] | tuple[tuple[float, ...], ...],
@@ -5720,33 +5768,9 @@ def receptor_level_count_run_distribution(
     if minimum_count < 1:
         raise ValueError(f"minimum_count must be >= 1, got {minimum_count}")
 
-    per_scenario: list[list[list[float]]] = []
-    for k in range(n_scenarios):
-        rows: list[list[float]] = []
-        for i in range(n_receptors):
-            mu = impacts[k][i]
-            sigma = uncertainties[k][i]
-            q: list[float] = []
-            for threshold in levels:
-                if sigma > 0:
-                    q.append(0.5 * math.erfc((threshold - mu) / (sigma * math.sqrt(2))))
-                else:
-                    q.append(1.0 if threshold <= mu else 0.0)
-            rows.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
-        per_scenario.append(rows)
-
-    event_probs: list[float] = []
-    for k in range(n_scenarios):
-        d = [1.0] + [0.0] * n_receptors
-        for i in range(n_receptors):
-            p = per_scenario[k][i][level]
-            updated = [0.0] * (n_receptors + 1)
-            for r in range(n_receptors + 1):
-                updated[r] = math.fsum(
-                    (d[r] * (1.0 - p), d[r - 1] * p if r > 0 else 0.0)
-                )
-            d = updated
-        event_probs.append(math.fsum(d[minimum_count:]))
+    event_probs = _count_run_event_probs(
+        impacts, uncertainties, levels, level, minimum_count
+    )
 
     state: dict[tuple[int, int], float] = {(0, 0): 1.0}
     for k in range(n_scenarios):
@@ -5846,6 +5870,120 @@ def receptor_level_count_run_quantile(
                 break
 
     return result
+
+
+def receptor_count_run_warning(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    durations: list[int] | tuple[int, ...],
+    level: int = 3,
+    minimum_count: int = 1,
+) -> tuple[
+    list[int], list[int], list[int | None], list[list[float]], list[list[float]]
+]:
+    """Warning levels from run-length quantiles of a receptor count event.
+
+    ``H``, ``W``, ``thresholds``, ``quantiles``, ``level`` and
+    ``minimum_count`` share the contract of
+    :func:`receptor_level_count_run_quantile` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim); ``runs`` below is exactly that
+    function's result. ``durations`` is a list or tuple of exactly 3
+    strictly increasing non-bool positive ints, each ``<= K``; container
+    or element type errors raise ``TypeError``, while length, value or
+    order errors raise ``ValueError``.
+
+    With ``runs[m]`` the longest-run quantile for ``quantiles[m]``,
+    ``levels[m]`` counts the durations ``d`` with ``d <= runs[m]`` and
+    ``triggers[m]`` is ``None`` when ``levels[m] == 0``, otherwise the
+    largest such ``d``.
+
+    The per-scenario event probabilities follow the existing
+    distribution: ``a[k] = fsum(Ck[minimum_count:])`` with ``Ck`` the
+    receptor-count PMF of scenario ``k`` as in
+    :func:`receptor_level_count_run_distribution`. For each duration
+    ``d = durations[j]`` a state vector ``s`` of length ``d`` holds the
+    probability of a current untriggered streak of length ``0..d - 1``
+    and starts as ``[1, 0, ...]``. Iterating ``k = 0..K - 1``:
+    ``first[k][j] = s[d - 1] * a[k]``,
+    ``s'[0] = fsum(s) * (1 - a[k])``,
+    ``s'[r] = s[r - 1] * a[k]`` for ``1 <= r < d``,
+    ``cumulative[k][j] = 1 - fsum(s')``, then ``s = s'``.
+
+    Returns ``(runs, levels, triggers, first, cumulative)``: the first
+    three are M-long ``list[int]``, ``list[int]`` and
+    ``list[int | None]``; the last two are K x 3
+    ``list[list[float]]`` in scenario x duration order, unrounded.
+    """
+    runs = receptor_level_count_run_quantile(
+        H, W, thresholds, quantiles, level=level, minimum_count=minimum_count
+    )
+
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+    n_scenarios = len(impacts)
+
+    if not isinstance(durations, (list, tuple)):
+        raise TypeError(
+            f"durations must be a list or tuple, got {type(durations).__name__}"
+        )
+    if len(durations) != 3:
+        raise ValueError(
+            f"durations must have exactly 3 elements, got {len(durations)}"
+        )
+    ds: list[int] = []
+    for j, item in enumerate(durations):
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise TypeError(
+                f"durations[{j}] must be an int, got {type(item).__name__}"
+            )
+        if item < 1:
+            raise ValueError(f"durations[{j}] must be >= 1, got {item!r}")
+        if item > n_scenarios:
+            raise ValueError(
+                f"durations[{j}] must be <= scenario count {n_scenarios}, "
+                f"got {item!r}"
+            )
+        if j > 0 and item <= ds[j - 1]:
+            raise ValueError(
+                f"durations must be strictly increasing, got {[*ds, item]!r}"
+            )
+        ds.append(item)
+
+    threshold_values = [float(item) for item in thresholds]
+    event_probs = _count_run_event_probs(
+        impacts, uncertainties, threshold_values, level, minimum_count
+    )
+
+    warning_levels: list[int] = []
+    triggers: list[int | None] = []
+    for run in runs:
+        count = 0
+        trigger: int | None = None
+        for d in ds:
+            if d <= run:
+                count += 1
+                trigger = d
+        warning_levels.append(count)
+        triggers.append(trigger)
+
+    first = [[0.0] * 3 for _ in range(n_scenarios)]
+    cumulative = [[0.0] * 3 for _ in range(n_scenarios)]
+    states = [[1.0] + [0.0] * (d - 1) for d in ds]
+    for k in range(n_scenarios):
+        a = event_probs[k]
+        for j, d in enumerate(ds):
+            s = states[j]
+            first[k][j] = s[d - 1] * a
+            updated = [0.0] * d
+            updated[0] = math.fsum(s) * (1.0 - a)
+            for r in range(1, d):
+                updated[r] = s[r - 1] * a
+            cumulative[k][j] = 1.0 - math.fsum(updated)
+            states[j] = updated
+
+    return runs, warning_levels, triggers, first, cumulative
 
 
 def receptor_level_event_probability(
