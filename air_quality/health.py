@@ -40,6 +40,7 @@ __all__ = [
     "receptor_level_count_quantile",
     "receptor_level_count_rise_distribution",
     "receptor_level_count_run_distribution",
+    "receptor_level_count_run_quantile",
     "receptor_level_count_share",
     "receptor_level_count_transition",
     "receptor_level_count_warning",
@@ -5762,6 +5763,68 @@ def receptor_level_count_run_distribution(
         math.fsum(state.get((r, m), 0.0) for r in range(n_scenarios + 1))
         for m in range(n_scenarios + 1)
     ]
+
+
+def receptor_level_count_run_quantile(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    level: int = 3,
+    minimum_count: int = 1,
+) -> list[int]:
+    """Quantiles of the longest run of a health-level receptor count event.
+
+    ``R`` is taken verbatim as the ``K + 1`` results returned by
+    ``receptor_level_count_run_distribution(H, W, thresholds, level,
+    minimum_count)``; see that function for the full scenario folding and
+    run-length recursion.
+
+    H, W, thresholds, level, minimum_count: same arguments, shapes and
+        constraints as ``receptor_level_count_run_distribution``.
+    quantiles: non-empty list or tuple of finite numbers, each in
+        ``[0, 1)`` and in non-decreasing order.
+    """
+    if not isinstance(quantiles, (list, tuple)):
+        raise TypeError(
+            f"quantiles must be a list or tuple, got {type(quantiles).__name__}"
+        )
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must not be empty")
+    qs: list[float] = []
+    for m, item in enumerate(quantiles):
+        if not _is_number(item):
+            raise TypeError(
+                f"quantiles[{m}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"quantiles[{m}]", value)
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"quantiles[{m}] must be in [0, 1), got {value!r}")
+        if m > 0 and value < qs[m - 1]:
+            raise ValueError(
+                f"quantiles must be non-decreasing, got {[*qs, value]!r}"
+            )
+        qs.append(value)
+
+    R = receptor_level_count_run_distribution(
+        H, W, thresholds, level, minimum_count
+    )
+
+    result: list[int] = []
+    for quantile in qs:
+        if quantile == 0.0:
+            result.append(0)
+            continue
+        cumulative_terms: list[float] = []
+        for m in range(len(R)):
+            cumulative_terms.append(R[m])
+            if math.fsum(cumulative_terms) >= quantile:
+                result.append(m)
+                break
+
+    return result
 
 
 def receptor_level_event_probability(
