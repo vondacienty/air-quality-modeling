@@ -30,6 +30,7 @@ __all__ = [
     "receptor_expected_excess",
     "receptor_level_count_probability",
     "receptor_level_count_quantile",
+    "receptor_level_interval",
     "receptor_level_probability",
     "receptor_level_quantile",
     "receptor_mitigation_frontier",
@@ -3404,6 +3405,167 @@ def receptor_level_probability(
     alert_probability = [probabilities[i][3] for i in range(n_receptors)]
 
     return probabilities, expected_level, alert_probability
+
+
+def receptor_level_interval(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    """Weighted mean and interval of the expected health level per receptor.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    Returns ``(mean, spread, lower, upper)`` where, per receptor ``i``,
+    with ``mu = H[k][i]``, ``sigma = W[k][i]`` and
+    ``Tj = thresholds[j]``:
+
+    * ``qj = 0.5 * erfc((Tj - mu) / (sigma * sqrt(2)))`` when
+      ``sigma > 0``, otherwise ``1.0`` if ``Tj <= mu`` else ``0.0``;
+    * ``p = [1 - q0, q0 - q1, q1 - q2, q2]`` holds the probabilities of
+      the four health levels for scenario ``k`` at receptor ``i``;
+    * ``e[k][i] = fsum(r * p[r] for r in range(4))`` is the expected
+      level and ``v[k][i] = fsum(r ** 2 * p[r] for r in range(4))
+      - e[k][i] ** 2`` is its variance;
+    * ``M[i] = fsum(w[k] * e[k][i])``,
+    * ``V[i] = fsum(w[k] * ((e[k][i] - M[i]) ** 2 + v[k][i]))``,
+    * ``spread[i] = z * sqrt(V[i])``,
+    * ``lower[i] = M[i] - spread[i]``,
+      ``upper[i] = M[i] + spread[i]``.
+
+    All four results are N-long lists of floats in receptor order,
+    unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    if weights is None:
+        w = [1.0 / n_scenarios] * n_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != n_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {n_scenarios}, "
+                f"got {len(weights)}"
+            )
+        raw = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            raw.append(value)
+        total_weight = math.fsum(raw)
+        if total_weight <= 0:
+            raise ValueError(f"weights sum must be > 0, got {total_weight!r}")
+        w = [value / total_weight for value in raw]
+
+    if not _is_number(z):
+        raise TypeError(f"z must be an int or float, got {type(z).__name__}")
+    z = float(z)
+    _check_finite("z", z)
+    if z < 0:
+        raise ValueError(f"z must be >= 0, got {z!r}")
+
+    expected: list[list[float]] = []
+    variances: list[list[float]] = []
+    for k in range(n_scenarios):
+        e_row: list[float] = []
+        v_row: list[float] = []
+        for i in range(n_receptors):
+            mu = impacts[k][i]
+            sigma = uncertainties[k][i]
+            q: list[float] = []
+            for level in levels:
+                if sigma > 0:
+                    q.append(0.5 * math.erfc((level - mu) / (sigma * math.sqrt(2))))
+                else:
+                    q.append(1.0 if level <= mu else 0.0)
+            p = [1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]]
+            e = math.fsum(r * p[r] for r in range(4))
+            v = math.fsum(r * r * p[r] for r in range(4)) - e * e
+            e_row.append(e)
+            v_row.append(v)
+        expected.append(e_row)
+        variances.append(v_row)
+
+    mean: list[float] = []
+    variance: list[float] = []
+    for i in range(n_receptors):
+        m = math.fsum(w[k] * expected[k][i] for k in range(n_scenarios))
+        v = math.fsum(
+            w[k] * ((expected[k][i] - m) ** 2 + variances[k][i])
+            for k in range(n_scenarios)
+        )
+        mean.append(m)
+        variance.append(v)
+
+    spread = [z * math.sqrt(variance[i]) for i in range(n_receptors)]
+    lower = [mean[i] - spread[i] for i in range(n_receptors)]
+    upper = [mean[i] + spread[i] for i in range(n_receptors)]
+
+    return mean, spread, lower, upper
 
 
 def quantile(
