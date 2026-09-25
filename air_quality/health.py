@@ -3106,7 +3106,7 @@ def receptor_level_count_quantile(
     thresholds: list[float] | tuple[float, ...],
     quantiles: list[float] | tuple[float, ...],
     weights: list[float] | tuple[float, ...] | None = None,
-) -> list[list[int]]:
+) -> list[list[list[int]]]:
     """Quantiles of the number of receptors at each health level.
 
     H: non-empty scenario x receptor matrix of health impacts; both the
@@ -3124,7 +3124,7 @@ def receptor_level_count_quantile(
         every scenario has weight ``1 / K``; otherwise the weights are
         normalized by their ``fsum``.
     Assuming the receptor errors within one scenario are mutually
-    independent, returns ``Q`` where, with ``sigma = W[k][i]``:
+    independent, returns ``R`` where, with ``sigma = W[k][i]``:
 
     * ``q[j] = 0.5 * erfc((thresholds[j] - H[k][i]) / (sigma * sqrt(2)))``
       when ``sigma > 0``, otherwise ``1.0`` if ``thresholds[j] <= H[k][i]``
@@ -3137,12 +3137,15 @@ def receptor_level_count_quantile(
       ``d'[r] = d[r] * (1 - p[k][i][l]) + (d[r - 1] * p[k][i][l] if r > 0
       else 0.0)``;
     * ``P[l][r] = fsum(w[k] * d[k][l][r] for k in range(K))``;
-    * ``Q[m][l]`` is ``0`` when ``quantiles[m] == 0``, otherwise the
-      smallest count ``r`` whose cumulative probability
-      ``fsum(P[l][:r + 1])`` is ``>= quantiles[m]``.
+    * ``R[m][l]`` is the (N + 1)-long one-hot vector of ints whose single
+      ``1`` sits at the chosen count ``r``: ``r`` is ``0`` when
+      ``quantiles[m] == 0``, otherwise the smallest count whose cumulative
+      probability ``fsum(P[l][:r + 1])`` is ``>= quantiles[m]``; every
+      other entry is ``0``.
 
-    ``Q`` is an M x 4 list of lists of ints, in ``quantiles`` then level
-    (``l = 0..3``) order.
+    ``R`` is an M x 4 x (N + 1) list of lists of lists of ints, in
+    ``quantiles`` then level (``l = 0..3``) then count (``r = 0..N``)
+    order.
     """
     impacts = _validate_matrix("H", H, non_negative=False)
     uncertainties = _validate_matrix("W", W)
@@ -3274,12 +3277,12 @@ def receptor_level_count_quantile(
         for level_index in range(4)
     ]
 
-    Q: list[list[int]] = []
+    R: list[list[list[int]]] = []
     for quantile in qs:
-        row: list[int] = []
+        matrix: list[list[int]] = []
         for level_index in range(4):
             if quantile == 0.0:
-                row.append(0)
+                chosen = 0
             else:
                 cumulative = 0.0
                 chosen = n_receptors
@@ -3288,10 +3291,12 @@ def receptor_level_count_quantile(
                     if cumulative >= quantile:
                         chosen = r
                         break
-                row.append(chosen)
-        Q.append(row)
+            matrix.append(
+                [1 if r == chosen else 0 for r in range(n_receptors + 1)]
+            )
+        R.append(matrix)
 
-    return Q
+    return R
 
 
 def receptor_level_probability(
