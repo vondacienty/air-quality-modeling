@@ -26,6 +26,7 @@ __all__ = [
     "receptor_count_interval",
     "receptor_count_probability",
     "receptor_count_quantile",
+    "receptor_count_run_policy_batch",
     "receptor_count_run_warning",
     "receptor_count_share",
     "receptor_excess",
@@ -5984,6 +5985,128 @@ def receptor_count_run_warning(
             states[j] = updated
 
     return runs, warning_levels, triggers, first, cumulative
+
+
+def receptor_count_run_policy_batch(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+) -> tuple[
+    list[
+        tuple[
+            list[int], list[int], list[int | None],
+            list[list[float]], list[list[float]],
+        ]
+    ],
+    list[float],
+    list[int],
+]:
+    """Run :func:`receptor_count_run_warning` over a batch of policies.
+
+    ``H``, ``W``, ``thresholds`` and ``quantiles`` share the contract of
+    :func:`receptor_count_run_warning` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim). ``policies`` is a non-empty
+    list or tuple; each policy is a list or tuple of exactly five
+    non-bool ints ``(level, minimum_count, d1, d2, d3)``. A wrong
+    container, item or element type raises ``TypeError``; an empty
+    policy list, a wrong item length, ``level`` outside ``0..3``,
+    ``minimum_count < 1``, or durations that are non-positive, not
+    strictly increasing or greater than the scenario count ``K`` raise
+    ``ValueError``.
+
+    For each policy ``p`` the function is called with ``(d1, d2, d3)``
+    as ``durations``; ``results[p]`` stores its
+    ``(runs, levels, triggers, first, cumulative)`` tuple verbatim and
+    ``scores[p] = fsum(cumulative[K - 1])``. ``order`` is the list of
+    zero-based policy indices sorted ascending by
+    ``(-max(levels), -scores[p], p)``, i.e. highest warning level, then
+    highest score, then the original index.
+
+    Returns ``(results, scores, order)``: a P-long ``list[tuple]`` with
+    the inner shapes of :func:`receptor_count_run_warning` (unrounded),
+    a P-long ``list[float]`` and a P-long ``list[int]``.
+    """
+    if not isinstance(policies, (list, tuple)):
+        raise TypeError(
+            f"policies must be a list or tuple, got {type(policies).__name__}"
+        )
+    if len(policies) == 0:
+        raise ValueError("policies must not be empty")
+
+    field_names = ("level", "minimum_count", "d1", "d2", "d3")
+    parsed: list[tuple[int, int, tuple[int, int, int]]] = []
+    for p, policy in enumerate(policies):
+        if not isinstance(policy, (list, tuple)):
+            raise TypeError(
+                f"policies[{p}] must be a list or tuple, "
+                f"got {type(policy).__name__}"
+            )
+        if len(policy) != 5:
+            raise ValueError(
+                f"policies[{p}] must have exactly 5 elements, got {len(policy)}"
+            )
+        values: list[int] = []
+        for c, item in enumerate(policy):
+            if not isinstance(item, int) or isinstance(item, bool):
+                raise TypeError(
+                    f"policies[{p}][{c}] ({field_names[c]}) must be an int, "
+                    f"got {type(item).__name__}"
+                )
+            values.append(item)
+        level, minimum_count, d1, d2, d3 = values
+        if not 0 <= level <= 3:
+            raise ValueError(
+                f"policies[{p}] level must be between 0 and 3, got {level}"
+            )
+        if minimum_count < 1:
+            raise ValueError(
+                f"policies[{p}] minimum_count must be >= 1, got {minimum_count}"
+            )
+        durations = (d1, d2, d3)
+        for c, d in enumerate(durations):
+            if d < 1:
+                raise ValueError(
+                    f"policies[{p}] {field_names[c + 2]} must be >= 1, got {d}"
+                )
+        if not d1 < d2 < d3:
+            raise ValueError(
+                f"policies[{p}] durations (d1, d2, d3) must be strictly "
+                f"increasing, got {list(durations)!r}"
+            )
+        parsed.append((level, minimum_count, durations))
+
+    n_scenarios = len(_validate_matrix("H", H, non_negative=False))
+    for p, (_, _, durations) in enumerate(parsed):
+        for c, d in enumerate(durations):
+            if d > n_scenarios:
+                raise ValueError(
+                    f"policies[{p}] {field_names[c + 2]} must be <= scenario "
+                    f"count {n_scenarios}, got {d}"
+                )
+
+    results: list[
+        tuple[
+            list[int], list[int], list[int | None],
+            list[list[float]], list[list[float]],
+        ]
+    ] = []
+    scores: list[float] = []
+    for level, minimum_count, durations in parsed:
+        output = receptor_count_run_warning(
+            H, W, thresholds, quantiles, list(durations),
+            level=level, minimum_count=minimum_count,
+        )
+        results.append(output)
+        cumulative = output[4]
+        scores.append(math.fsum(cumulative[n_scenarios - 1]))
+
+    order = sorted(
+        range(len(parsed)),
+        key=lambda p: (-max(results[p][1]), -scores[p], p),
+    )
+    return results, scores, order
 
 
 def receptor_level_event_probability(
