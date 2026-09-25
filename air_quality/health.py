@@ -20,6 +20,7 @@ __all__ = [
     "level_probability",
     "max_level_probability",
     "max_level_quantile",
+    "policy_recommend",
     "quantile",
     "receptor_count_cvar",
     "receptor_count_event_probability",
@@ -8245,6 +8246,85 @@ def receptor_mitigation_frontier(
         )
         for excess, spread, triggers, total_cost, choice_tuple, interval in frontier
     ]
+
+
+def policy_recommend(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budget: float,
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> list[tuple]:
+    """Pair each non-dominated mitigation plan with its best run policy.
+
+    ``H``, ``W``, ``thresholds``, ``options``, ``budget``, ``weights`` and
+    ``z`` share the contract of :func:`receptor_mitigation_frontier`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim);
+    ``quantiles`` and ``policies`` share the contract of
+    :func:`receptor_count_run_policy_batch`, which in particular requires
+    ``K >= 2`` scenarios.
+
+    Let ``F = receptor_mitigation_frontier(H, W, thresholds, options,
+    budget, weights, z)``. For each frontier entry
+    ``(choice, C, S, D, G, interval)`` the reduced impact matrix ``H'``
+    with ``H'[k][i] = H[k][i] - options[i][choice[i]][0]`` replaces ``H``
+    in a call to :func:`receptor_count_run_policy_batch` returning
+    ``(results, scores, order)``; with ``p = order[0]``,
+    ``o = results[p]``, ``a = max(o[1])`` and ``s = scores[p]`` the entry
+    contributes ``(choice, p, C, S, D, G, a, s, interval, o)``.
+
+    Returns the list of such tuples sorted ascending by
+    ``(S, D, G, C, -a, -s, choice, p)``. ``choice`` is an N-long list of
+    ints, ``p`` is an int, ``C``, ``S``, ``D`` and ``s`` are floats, ``G``
+    and ``a`` are ints, ``interval`` is the ``(M, R, L, U)`` tuple from
+    the frontier and ``o`` is the winning policy's
+    ``(runs, levels, triggers, first, cumulative)`` tuple, all unrounded.
+    """
+    frontier = receptor_mitigation_frontier(
+        H, W, thresholds, options, budget, weights, z
+    )
+
+    impacts = _validate_matrix("H", H, non_negative=False)
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    reductions = [[float(pair[0]) for pair in group] for group in options]
+
+    rows: list[tuple] = []
+    for choice, C, S, D, G, interval in frontier:
+        adjusted = [
+            [
+                impacts[k][i] - reductions[i][choice[i]]
+                for i in range(n_receptors)
+            ]
+            for k in range(n_scenarios)
+        ]
+        results, scores, order = receptor_count_run_policy_batch(
+            adjusted, W, thresholds, quantiles, policies
+        )
+        p = order[0]
+        o = results[p]
+        a = max(o[1])
+        s = scores[p]
+        rows.append((choice, p, C, S, D, G, a, s, interval, o))
+
+    rows.sort(
+        key=lambda item: (
+            item[3],
+            item[4],
+            item[5],
+            item[2],
+            -item[6],
+            -item[7],
+            item[0],
+            item[1],
+        )
+    )
+
+    return rows
 
 
 def receptor_level_quantile(
