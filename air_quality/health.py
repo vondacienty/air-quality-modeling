@@ -39,6 +39,7 @@ __all__ = [
     "receptor_level_count_probability",
     "receptor_level_count_quantile",
     "receptor_level_count_share",
+    "receptor_level_count_transition",
     "receptor_level_count_warning",
     "receptor_level_event_probability",
     "receptor_level_interval",
@@ -5318,6 +5319,146 @@ def receptor_level_count_share(
         ES.append(es_rows)
 
     return PS, ES
+
+
+def receptor_level_count_transition(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    level: int = 3,
+) -> list[list[list[float]]]:
+    """Joint count distribution of a health level across scenario pairs.
+
+    Scenario errors are treated as independent and receptors are folded in
+    their given order. For each pair of consecutive scenarios the state
+    ``D[(c, d)]`` is the probability that exactly ``c`` receptors are at
+    ``level`` in the earlier scenario and exactly ``d`` in the following
+    one.
+
+    H: K x N (K >= 2, N > 0) scenario x receptor matrix of health impacts;
+        both the outer container and each row must be a list or tuple, rows
+        must be non-empty and share one receptor count; each value finite
+        (negative values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    level: integer health level to track, ``0 <= level <= 3`` (default 3).
+    With ``mu = H[k][i]`` and ``sigma = W[k][i]``:
+
+    * ``q[j] = 0.5 * erfc((thresholds[j] - mu) / (sigma * sqrt(2)))`` when
+      ``sigma > 0``, otherwise ``1.0`` if ``thresholds[j] <= mu`` else
+      ``0.0``;
+    * ``p[k][i] = [1 - q0, q0 - q1, q1 - q2, q2]`` holds the probabilities
+      of the four health levels for scenario ``k`` at receptor ``i``.
+
+    For each transition ``t`` let ``u[i] = p[t][i][level]`` and
+    ``v[i] = p[t + 1][i][level]``. The recursion starts from
+    ``D[(0, 0)] = 1.0`` and folds the receptors in one at a time; for each
+    receptor every state key ``(c, d)`` (visited in sorted order) spreads
+    its mass over the four targets ``(c, d)``, ``(c + 1, d)``,
+    ``(c, d + 1)``, ``(c + 1, d + 1)`` with probabilities
+    ``(1 - u)(1 - v)``, ``u(1 - v)``, ``(1 - u)v``, ``uv``, contributions
+    to the same target being merged with ``math.fsum``.
+
+    Returns a ``(K - 1) x (N + 1) x (N + 1)`` ``list[list[list[float]]]``
+    indexed by transition, then count in the earlier scenario, then count
+    in the following scenario, unrounded. Each ``T[t]`` sums to 1.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(impacts) < 2:
+        raise ValueError(f"H must have at least 2 scenarios, got {len(impacts)}")
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    if not isinstance(level, int) or isinstance(level, bool):
+        raise TypeError(f"level must be an int, got {type(level).__name__}")
+    if not 0 <= level <= 3:
+        raise ValueError(f"level must be between 0 and 3, got {level}")
+
+    per_scenario: list[list[list[float]]] = []
+    for k in range(n_scenarios):
+        rows: list[list[float]] = []
+        for i in range(n_receptors):
+            mu = impacts[k][i]
+            sigma = uncertainties[k][i]
+            q: list[float] = []
+            for threshold in levels:
+                if sigma > 0:
+                    q.append(0.5 * math.erfc((threshold - mu) / (sigma * math.sqrt(2))))
+                else:
+                    q.append(1.0 if threshold <= mu else 0.0)
+            rows.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
+        per_scenario.append(rows)
+
+    transitions: list[list[list[float]]] = []
+    for t in range(n_scenarios - 1):
+        state: dict[tuple[int, int], float] = {(0, 0): 1.0}
+        for i in range(n_receptors):
+            u = per_scenario[t][i][level]
+            v = per_scenario[t + 1][i][level]
+            moves = (
+                ((0, 0), (1.0 - u) * (1.0 - v)),
+                ((1, 0), u * (1.0 - v)),
+                ((0, 1), (1.0 - u) * v),
+                ((1, 1), u * v),
+            )
+            updated: dict[tuple[int, int], list[float]] = {}
+            for (c, d) in sorted(state):
+                mass = state[(c, d)]
+                for (a, b), probability in moves:
+                    updated.setdefault((c + a, d + b), []).append(
+                        mass * probability
+                    )
+            state = {
+                target: math.fsum(terms) for target, terms in updated.items()
+            }
+        transitions.append(
+            [
+                [state.get((c, d), 0.0) for d in range(n_receptors + 1)]
+                for c in range(n_receptors + 1)
+            ]
+        )
+
+    return transitions
 
 
 def receptor_level_event_probability(
