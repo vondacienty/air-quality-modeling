@@ -44,6 +44,7 @@ __all__ = [
     "receptor_level_interval",
     "receptor_level_probability",
     "receptor_level_quantile",
+    "receptor_level_rise_distribution",
     "receptor_level_transition",
     "receptor_mitigation_frontier",
     "receptor_mitigation_plan",
@@ -7618,4 +7619,123 @@ def receptor_level_transition(
         transitions.append(matrix)
 
     return transitions
+
+
+def receptor_level_rise_distribution(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+) -> list[list[float]]:
+    """Per-receptor distribution of health-level rises across scenarios.
+
+    Scenario errors are treated as independent; for each receptor the
+    number of scenarios (among ``k = 1..K - 1``) in which the health level
+    rises relative to the previous scenario is tallied.
+
+    H: K x N (K >= 2, N > 0) scenario x receptor matrix of health impacts;
+        both the outer container and each row must be a list or tuple, rows
+        must be non-empty and share one receptor count; each value finite
+        (negative values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    With ``mu = H[k][i]`` and ``sigma = W[k][i]``:
+
+    * ``q[j] = 0.5 * erfc((thresholds[j] - mu) / (sigma * sqrt(2)))`` when
+      ``sigma > 0``, otherwise ``1.0`` if ``thresholds[j] <= mu`` else
+      ``0.0``;
+    * ``p[k][i] = [1 - q0, q0 - q1, q1 - q2, q2]`` holds the probabilities
+      of the four health levels for scenario ``k`` at receptor ``i``;
+    * per receptor, ``D[r][0] = p[0][i][r]`` (all other entries 0) and for
+      ``k = 1..K - 1``, ``c = 0..k``,
+      ``D'[b][c] = fsum(D[a][c - (a < b)] * p[k][i][b] for a in 0..3)``
+      (out-of-range terms skipped), then ``D = D'``.
+
+    Returns an ``N x K`` ``list[list[float]]`` with
+    ``R[i][c] = fsum(D[r][c] for r in 0..3)``, unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(impacts) < 2:
+        raise ValueError(f"H must have at least 2 scenarios, got {len(impacts)}")
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    per_scenario: list[list[list[float]]] = []
+    for k in range(n_scenarios):
+        rows: list[list[float]] = []
+        for i in range(n_receptors):
+            mu = impacts[k][i]
+            sigma = uncertainties[k][i]
+            q: list[float] = []
+            for level in levels:
+                if sigma > 0:
+                    q.append(0.5 * math.erfc((level - mu) / (sigma * math.sqrt(2))))
+                else:
+                    q.append(1.0 if level <= mu else 0.0)
+            rows.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
+        per_scenario.append(rows)
+
+    distribution: list[list[float]] = []
+    for i in range(n_receptors):
+        state = [[0.0] * n_scenarios for _ in range(4)]
+        for r in range(4):
+            state[r][0] = per_scenario[0][i][r]
+        for k in range(1, n_scenarios):
+            updated = [[0.0] * n_scenarios for _ in range(4)]
+            for b in range(4):
+                p_b = per_scenario[k][i][b]
+                for c in range(k + 1):
+                    updated[b][c] = math.fsum(
+                        state[a][c - (1 if a < b else 0)] * p_b
+                        for a in range(4)
+                        if c - (1 if a < b else 0) >= 0
+                    )
+            state = updated
+        distribution.append(
+            [
+                math.fsum(state[r][c] for r in range(4))
+                for c in range(n_scenarios)
+            ]
+        )
+
+    return distribution
 
