@@ -39,6 +39,7 @@ __all__ = [
     "receptor_level_count_probability",
     "receptor_level_count_quantile",
     "receptor_level_count_rise_distribution",
+    "receptor_level_count_run_distribution",
     "receptor_level_count_share",
     "receptor_level_count_transition",
     "receptor_level_count_warning",
@@ -5604,6 +5605,167 @@ def receptor_level_count_rise_distribution(
     return [
         math.fsum(state.get((c, r), 0.0) for c in range(n_receptors + 1))
         for r in range(n_scenarios)
+    ]
+
+
+def receptor_level_count_run_distribution(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    level: int = 3,
+    minimum_count: int = 1,
+) -> list[float]:
+    """Distribution of the longest run of scenarios meeting a level count.
+
+    Scenario errors are treated as independent. For each scenario ``k`` the
+    ``N`` receptors are folded in their given order, taking ``p`` to be the
+    probability that the receptor is at ``level``, yielding the count PMF
+    ``Ck[c]`` over the number ``c`` of receptors at ``level``. Across the
+    scenario sequence an "event" happens at scenario ``k`` when its count
+    is at least ``minimum_count``.
+
+    H: K x N (K >= 2, N > 0) scenario x receptor matrix of health impacts;
+        both the outer container and each row must be a list or tuple, rows
+        must be non-empty and share one receptor count; each value finite
+        (negative values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    level: non-bool integer health level to track, ``0 <= level <= 3``
+        (default 3).
+    minimum_count: non-bool integer, ``>= 1``, the level count that makes a
+        scenario an event (default 1).
+    With ``mu = H[k][i]`` and ``sigma = W[k][i]``:
+
+    * ``q[j] = 0.5 * erfc((thresholds[j] - mu) / (sigma * sqrt(2)))`` when
+      ``sigma > 0``, otherwise ``1.0`` if ``thresholds[j] <= mu`` else
+      ``0.0``;
+    * ``p[k][i] = [1 - q0, q0 - q1, q1 - q2, q2]`` holds the probabilities
+      of the four health levels for scenario ``k`` at receptor ``i``;
+    * ``p = p[k][i][level]`` is the probability of the tracked level.
+
+    For each scenario ``k`` the count PMF starts as ``d = [1] + [0] * N``
+    and folds the receptors one at a time with
+    ``d'[r] = fsum((d[r] * (1 - p), d[r - 1] * p if r > 0 else 0.0))``,
+    giving ``Ck = d``, and the event probability is
+    ``ak = fsum(Ck[minimum_count:])`` (an empty slice, when
+    ``minimum_count`` exceeds ``N``, contributes ``0.0``).
+
+    The cross-scenario state ``D[(r, m)]`` holds the probability that the
+    current run of events has length ``r`` with longest run ``m`` so far;
+    it starts as ``{(0, 0): 1.0}``. For ``k = 0..K - 1`` each state is
+    spread in lexicographic ``(r, m)`` order, first appending a non-event
+    with probability ``1 - ak`` onto ``(0, m)`` and then an event with
+    probability ``ak`` onto
+    ``(min(r + 1, K), max(m, r + 1))``; contributions to the same target
+    are merged with ``math.fsum``.
+
+    Returns the (K + 1)-long ``list[float]``
+    ``R[m] = fsum(D[(r, m)] for r in range(K + 1))`` for ``m = 0..K``,
+    the distribution over the longest run of event scenarios, unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(impacts) < 2:
+        raise ValueError(f"H must have at least 2 scenarios, got {len(impacts)}")
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    if not isinstance(level, int) or isinstance(level, bool):
+        raise TypeError(f"level must be an int, got {type(level).__name__}")
+    if not 0 <= level <= 3:
+        raise ValueError(f"level must be between 0 and 3, got {level}")
+
+    if not isinstance(minimum_count, int) or isinstance(minimum_count, bool):
+        raise TypeError(
+            f"minimum_count must be an int, got {type(minimum_count).__name__}"
+        )
+    if minimum_count < 1:
+        raise ValueError(
+            f"minimum_count must be >= 1, got {minimum_count}"
+        )
+
+    per_scenario: list[list[list[float]]] = []
+    for k in range(n_scenarios):
+        rows: list[list[float]] = []
+        for i in range(n_receptors):
+            mu = impacts[k][i]
+            sigma = uncertainties[k][i]
+            q: list[float] = []
+            for threshold in levels:
+                if sigma > 0:
+                    q.append(0.5 * math.erfc((threshold - mu) / (sigma * math.sqrt(2))))
+                else:
+                    q.append(1.0 if threshold <= mu else 0.0)
+            rows.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
+        per_scenario.append(rows)
+
+    event_probabilities: list[float] = []
+    for k in range(n_scenarios):
+        d = [1.0] + [0.0] * n_receptors
+        for i in range(n_receptors):
+            p = per_scenario[k][i][level]
+            updated = [0.0] * (n_receptors + 1)
+            for r in range(n_receptors + 1):
+                updated[r] = math.fsum(
+                    (d[r] * (1.0 - p), d[r - 1] * p if r > 0 else 0.0)
+                )
+            d = updated
+        event_probabilities.append(math.fsum(d[minimum_count:]))
+
+    state: dict[tuple[int, int], float] = {(0, 0): 1.0}
+    for k in range(n_scenarios):
+        ak = event_probabilities[k]
+        non_event = 1.0 - ak
+        updated: dict[tuple[int, int], list[float]] = {}
+        for r, m in sorted(state):
+            mass = state[(r, m)]
+            updated.setdefault((0, m), []).append(mass * non_event)
+            event_target = (min(r + 1, n_scenarios), max(m, r + 1))
+            updated.setdefault(event_target, []).append(mass * ak)
+        state = {target: math.fsum(terms) for target, terms in updated.items()}
+
+    return [
+        math.fsum(state.get((r, m), 0.0) for r in range(n_scenarios + 1))
+        for m in range(n_scenarios + 1)
     ]
 
 
