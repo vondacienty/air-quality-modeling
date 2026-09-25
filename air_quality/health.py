@@ -40,6 +40,7 @@ __all__ = [
     "receptor_level_count_quantile",
     "receptor_level_count_rise_distribution",
     "receptor_level_count_run_distribution",
+    "receptor_level_count_run_quantile",
     "receptor_level_count_share",
     "receptor_level_count_transition",
     "receptor_level_count_warning",
@@ -5762,6 +5763,89 @@ def receptor_level_count_run_distribution(
         math.fsum(state.get((r, m), 0.0) for r in range(n_scenarios + 1))
         for m in range(n_scenarios + 1)
     ]
+
+
+def receptor_level_count_run_quantile(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    level: int = 3,
+    minimum_count: int = 1,
+) -> list[int]:
+    """Quantiles of the longest run of a health-level receptor count event.
+
+    The run-length distribution is taken verbatim from
+    :func:`receptor_level_count_run_distribution`; see that function for the
+    full scenario folding and error contract. Scenario errors are treated as
+    independent: each scenario ``k`` folds its ``N`` receptors into the count
+    PMF ``Ck``, the event is "at least ``minimum_count`` receptors at
+    ``level``" with probability ``ak``, and states ``(r, m)`` track the
+    current run length ``r`` and longest run so far ``m`` across scenarios in
+    their given order.
+
+    H: K x N (K >= 2, N > 0) scenario x receptor matrix of health impacts;
+        both the outer container and each row must be a list or tuple, rows
+        must be non-empty and share one receptor count; each value finite
+        (negative values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    quantiles: non-empty list or tuple of finite numbers, each in
+        ``[0, 1)`` and in non-decreasing order.
+    level: non-bool integer health level to track, ``0 <= level <= 3``
+        (default 3).
+    minimum_count: non-bool integer event threshold, ``minimum_count >= 1``
+        (default 1).
+
+    Let ``R`` be the ``(K + 1)``-long result returned by
+    ``receptor_level_count_run_distribution(H, W, thresholds, level,
+    minimum_count)``, the distribution over the longest run length. For
+    quantile ``q`` the result is ``0`` when ``q == 0``, otherwise the
+    smallest ``m`` such that ``fsum(R[:m + 1]) >= q``.
+
+    Returns a ``list[int]`` in ``quantiles`` order, unrounded.
+    """
+    R = receptor_level_count_run_distribution(
+        H, W, thresholds, level=level, minimum_count=minimum_count
+    )
+
+    if not isinstance(quantiles, (list, tuple)):
+        raise TypeError(
+            f"quantiles must be a list or tuple, got {type(quantiles).__name__}"
+        )
+    if len(quantiles) == 0:
+        raise ValueError("quantiles must not be empty")
+    qs: list[float] = []
+    for m, item in enumerate(quantiles):
+        if not _is_number(item):
+            raise TypeError(
+                f"quantiles[{m}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"quantiles[{m}]", value)
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"quantiles[{m}] must be in [0, 1), got {value!r}")
+        if m > 0 and value < qs[m - 1]:
+            raise ValueError(
+                f"quantiles must be non-decreasing, got {[*qs, value]!r}"
+            )
+        qs.append(value)
+
+    result: list[int] = [0] * len(qs)
+    for m_index, quantile in enumerate(qs):
+        if quantile == 0.0:
+            continue
+        cumulative_terms: list[float] = []
+        for m in range(len(R)):
+            cumulative_terms.append(R[m])
+            if math.fsum(cumulative_terms) >= quantile:
+                result[m_index] = m
+                break
+
+    return result
 
 
 def receptor_level_event_probability(
