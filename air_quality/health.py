@@ -31,6 +31,7 @@ __all__ = [
     "receptor_level_count_interval",
     "receptor_level_count_probability",
     "receptor_level_count_quantile",
+    "receptor_level_count_warning",
     "receptor_level_interval",
     "receptor_level_probability",
     "receptor_level_quantile",
@@ -3470,6 +3471,51 @@ def receptor_level_count_quantile(
         Q.append(row)
 
     return Q
+
+
+def receptor_level_count_warning(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+    z: float = 1.96,
+) -> tuple[int, float | None, list[float], tuple[list[float], list[float]]]:
+    """Warning level derived from the receptor level-count interval.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    z: number of standard deviations for the interval half-width; finite
+        and >= 0 (default 1.96).
+    With ``(M, R, L, U) = receptor_level_count_interval(H, W, thresholds,
+    weights, z)``, returns ``(level, trigger, scores, interval)`` where:
+
+    * ``level`` is the largest level ``r`` in ``1..3`` with ``L[r] > 0``,
+      or ``0`` when no such level exists;
+    * ``trigger`` is ``thresholds[level - 1]`` when ``level > 0``,
+      otherwise ``None``;
+    * ``scores`` is ``M``;
+    * ``interval`` is the pair ``(L, U)``.
+
+    ``level`` is an int, ``trigger`` a float or ``None``, ``scores`` a
+    4-long list of floats and ``interval`` a 2-tuple of 4-long lists of
+    floats, all in level (``0..3``) order and unrounded.
+    """
+    M, _, L, U = receptor_level_count_interval(H, W, thresholds, weights, z)
+
+    level = max((r for r in range(1, 4) if L[r] > 0), default=0)
+    trigger = float(thresholds[level - 1]) if level > 0 else None
+
+    return level, trigger, M, (L, U)
 
 
 def receptor_level_interval(
