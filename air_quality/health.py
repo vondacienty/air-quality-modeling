@@ -21,6 +21,7 @@ __all__ = [
     "max_level_probability",
     "max_level_quantile",
     "quantile",
+    "receptor_count_event_probability",
     "receptor_count_interval",
     "receptor_count_probability",
     "receptor_count_quantile",
@@ -2461,6 +2462,190 @@ def receptor_excess_warning(
     ]
 
     return levels, triggers, M, (L, U)
+
+
+def receptor_count_event_probability(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    minimums: list[int] | tuple[int, ...],
+    weights: list[float] | tuple[float, ...] | None = None,
+) -> tuple[list[float], float]:
+    """Probability that per-threshold exceedance counts meet minimums.
+
+    H: non-empty scenario x receptor matrix of health impacts; both the
+        outer container and each row must be a list or tuple, rows must be
+        non-empty and share one receptor count; each value finite (negative
+        values allowed).
+    W: matrix of uncertainties with the same shape as ``H``; each value
+        finite and >= 0.
+    thresholds: list or tuple of exactly 3 finite, non-negative, strictly
+        increasing numbers.
+    minimums: list or tuple of exactly 3 non-bool ints, each >= 0; entry
+        ``j`` is the required number of receptors exceeding
+        ``thresholds[j]``. If any entry exceeds the receptor count, the
+        event probability is ``0.0``.
+    weights: ``None`` (the default) or a K-long list or tuple of finite,
+        non-negative entries whose ``fsum`` is positive. With ``None``
+        every scenario has weight ``1 / K``; otherwise the weights are
+        normalized by their ``fsum``.
+    Assuming the receptor errors within one scenario are mutually
+    independent, returns ``(A, weighted)`` where, with
+    ``sigma = W[k][i]``:
+
+    * ``q[j] = 0.5 * erfc((thresholds[j] - H[k][i]) / (sigma * sqrt(2)))``
+      when ``sigma > 0``, otherwise ``1.0`` if ``thresholds[j] <= H[k][i]``
+      else ``0.0``;
+    * ``p = [1 - q0, q0 - q1, q1 - q2, q2]`` holds the probabilities of
+      the four health levels at the receptor;
+    * a state ``c`` is a 3-tuple counting the receptors exceeding each
+      threshold; the state distribution starts as
+      ``{(0, 0, 0): 1.0}`` and folds the receptors in one at a time,
+      visiting states in lexicographic order and levels ``l`` in
+      ``0..3`` with ``c'[j] = c[j] + (1 if l > j else 0)`` and
+      ``D'[c'] += D[c] * p[l]``, accumulated with ``fsum``;
+    * ``A[k] = fsum(D[c] for c with c[j] >= minimums[j] for all j)``;
+    * ``weighted = fsum(w[k] * A[k] for k in range(K))``.
+
+    ``A`` is a K-long list of floats in scenario order and ``weighted``
+    is a float, both unrounded.
+    """
+    impacts = _validate_matrix("H", H, non_negative=False)
+    uncertainties = _validate_matrix("W", W)
+
+    if len(uncertainties) != len(impacts):
+        raise ValueError(
+            f"H and W must have the same number of scenarios, "
+            f"got {len(impacts)} and {len(uncertainties)}"
+        )
+    n_scenarios = len(impacts)
+    n_receptors = len(impacts[0])
+    for k, row in enumerate(uncertainties):
+        if len(row) != n_receptors:
+            raise ValueError(
+                f"W[{k}] must have {n_receptors} elements, got {len(row)}"
+            )
+
+    if not isinstance(thresholds, (list, tuple)):
+        raise TypeError(
+            f"thresholds must be a list or tuple, got {type(thresholds).__name__}"
+        )
+    if len(thresholds) != 3:
+        raise ValueError(
+            f"thresholds must have exactly 3 elements, got {len(thresholds)}"
+        )
+    levels = []
+    for j, item in enumerate(thresholds):
+        if not _is_number(item):
+            raise TypeError(
+                f"thresholds[{j}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"thresholds[{j}]", value)
+        if value < 0:
+            raise ValueError(f"thresholds[{j}] must be >= 0, got {value!r}")
+        levels.append(value)
+    for j in range(1, 3):
+        if not levels[j] > levels[j - 1]:
+            raise ValueError(
+                f"thresholds must be strictly increasing, got {levels!r}"
+            )
+
+    if not isinstance(minimums, (list, tuple)):
+        raise TypeError(
+            f"minimums must be a list or tuple, got {type(minimums).__name__}"
+        )
+    if len(minimums) != 3:
+        raise ValueError(
+            f"minimums must have exactly 3 elements, got {len(minimums)}"
+        )
+    mins: list[int] = []
+    for j, item in enumerate(minimums):
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise TypeError(
+                f"minimums[{j}] must be an int, got {type(item).__name__}"
+            )
+        if item < 0:
+            raise ValueError(f"minimums[{j}] must be >= 0, got {item!r}")
+        mins.append(item)
+
+    if weights is None:
+        w = [1.0 / n_scenarios] * n_scenarios
+    else:
+        if not isinstance(weights, (list, tuple)):
+            raise TypeError(
+                f"weights must be a list or tuple, got {type(weights).__name__}"
+            )
+        if len(weights) != n_scenarios:
+            raise ValueError(
+                f"weights length must equal scenario count {n_scenarios}, "
+                f"got {len(weights)}"
+            )
+        raw = []
+        for k, item in enumerate(weights):
+            if not _is_number(item):
+                raise TypeError(
+                    f"weights[{k}] must be an int or float, "
+                    f"got {type(item).__name__}"
+                )
+            value = float(item)
+            _check_finite(f"weights[{k}]", value)
+            if value < 0:
+                raise ValueError(f"weights[{k}] must be >= 0, got {value!r}")
+            raw.append(value)
+        total_weight = math.fsum(raw)
+        if total_weight <= 0:
+            raise ValueError(f"weights sum must be > 0, got {total_weight!r}")
+        w = [value / total_weight for value in raw]
+
+    impossible = any(m > n_receptors for m in mins)
+
+    A: list[float] = []
+    for k in range(n_scenarios):
+        if impossible:
+            A.append(0.0)
+            continue
+        per_receptor: list[list[float]] = []
+        for i in range(n_receptors):
+            mu = impacts[k][i]
+            sigma = uncertainties[k][i]
+            q: list[float] = []
+            for level in levels:
+                if sigma > 0:
+                    q.append(0.5 * math.erfc((level - mu) / (sigma * math.sqrt(2))))
+                else:
+                    q.append(1.0 if level <= mu else 0.0)
+            per_receptor.append([1.0 - q[0], q[0] - q[1], q[1] - q[2], q[2]])
+
+        distribution: dict[tuple[int, int, int], float] = {(0, 0, 0): 1.0}
+        for i in range(n_receptors):
+            p = per_receptor[i]
+            incoming: dict[tuple[int, int, int], list[float]] = {}
+            for c in sorted(distribution):
+                mass = distribution[c]
+                for l in range(4):
+                    key = (
+                        c[0] + (1 if l > 0 else 0),
+                        c[1] + (1 if l > 1 else 0),
+                        c[2] + (1 if l > 2 else 0),
+                    )
+                    incoming.setdefault(key, []).append(mass * p[l])
+            distribution = {
+                key: math.fsum(terms) for key, terms in incoming.items()
+            }
+
+        A.append(
+            math.fsum(
+                mass
+                for c, mass in distribution.items()
+                if c[0] >= mins[0] and c[1] >= mins[1] and c[2] >= mins[2]
+            )
+        )
+
+    weighted = math.fsum(w[k] * A[k] for k in range(n_scenarios))
+
+    return A, weighted
 
 
 def receptor_count_probability(
