@@ -3106,7 +3106,7 @@ def receptor_level_count_quantile(
     thresholds: list[float] | tuple[float, ...],
     quantiles: list[float] | tuple[float, ...],
     weights: list[float] | tuple[float, ...] | None = None,
-) -> list[list[int]]:
+) -> list[list[list[int]]]:
     """Quantiles of the number of receptors at each health level.
 
     H: non-empty scenario x receptor matrix of health impacts; both the
@@ -3137,12 +3137,15 @@ def receptor_level_count_quantile(
       ``d'[r] = d[r] * (1 - p[k][i][l]) + (d[r - 1] * p[k][i][l] if r > 0
       else 0.0)``;
     * ``P[l][r] = fsum(w[k] * d[k][l][r] for k in range(K))``;
-    * ``Q[m][l]`` is ``0`` when ``quantiles[m] == 0``, otherwise the
-      smallest count ``r`` whose cumulative probability
-      ``fsum(P[l][:r + 1])`` is ``>= quantiles[m]``.
+    * ``Q[m][l]`` is the (N + 1)-long one-hot vector whose entry is ``1``
+      at the count ``r`` that is ``0`` when ``quantiles[m] == 0`` and
+      otherwise the smallest count whose cumulative probability
+      ``fsum(P[l][s] for s in range(r + 1))`` is ``>= quantiles[m]``,
+      and ``0`` at every other count.
 
-    ``Q`` is an M x 4 list of lists of ints, in ``quantiles`` then level
-    (``l = 0..3``) order.
+    ``Q`` is an M x 4 x (N + 1) list of lists of lists of ints, in
+    ``quantiles`` then level (``l = 0..3``) then count (``r = 0..N``)
+    order.
     """
     impacts = _validate_matrix("H", H, non_negative=False)
     uncertainties = _validate_matrix("W", W)
@@ -3274,21 +3277,24 @@ def receptor_level_count_quantile(
         for level_index in range(4)
     ]
 
-    Q: list[list[int]] = []
+    Q: list[list[list[int]]] = []
     for quantile in qs:
-        row: list[int] = []
+        row: list[list[int]] = []
         for level_index in range(4):
             if quantile == 0.0:
-                row.append(0)
+                chosen = 0
             else:
-                cumulative = 0.0
                 chosen = n_receptors
                 for r in range(n_receptors + 1):
-                    cumulative = math.fsum([cumulative, P[level_index][r]])
-                    if cumulative >= quantile:
+                    if (
+                        math.fsum(P[level_index][s] for s in range(r + 1))
+                        >= quantile
+                    ):
                         chosen = r
                         break
-                row.append(chosen)
+            row.append(
+                [1 if r == chosen else 0 for r in range(n_receptors + 1)]
+            )
         Q.append(row)
 
     return Q
