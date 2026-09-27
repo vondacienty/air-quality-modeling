@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_grid",
+    "robust_policy_grid_regions",
     "robust_policy_grid_turns",
     "robust_policy_report",
     "robust_policy_sensitivity",
@@ -9005,6 +9006,131 @@ def robust_policy_grid_turns(
         "states": states,
         "z_changes": z_changes,
         "budget_changes": budget_changes,
+    }
+
+
+def _recursive_list_copy(value):
+    if isinstance(value, (list, tuple)):
+        return [_recursive_list_copy(item) for item in value]
+    return value
+
+
+def robust_policy_grid_regions(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Orthogonally connected same-state regions of the robust grid.
+
+    Every parameter shares the contract of :func:`robust_policy_grid_turns`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim;
+    exceptions propagate unchanged). :func:`robust_policy_grid_turns` is
+    called exactly once to obtain the grid ``G``.
+
+    A cell ``[b, r]`` is adjacent only to its four orthogonal neighbours
+    (up, down, left, right), and two cells share a state when their
+    ``G["states"]`` list values are equal. Unassigned cells are scanned
+    with ``b`` as the outer and ``r`` as the inner index; each unassigned
+    cell seeds a region of all same-state orthogonally reachable cells,
+    with region ids increasing from 0 and members sorted by ``(b, r)``
+    ascending. Each region is a dict whose keys in order are ``id``,
+    ``cells``, ``budget_bounds``, ``z_bounds`` and ``state``: ``cells``
+    is the list of ``[b, r]`` members, ``budget_bounds`` and
+    ``z_bounds`` are the two-element float lists of the budget and ``z``
+    values at the member ``b`` and ``r`` extremes, and ``state`` is a
+    recursive list copy of the shared state. Whenever members of two
+    different regions are orthogonally adjacent, an edge
+    ``[smaller_id, larger_id]`` is formed; edges are deduplicated and
+    sorted by both ids ascending.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``states``, ``regions`` and ``adjacency``: the first three are
+    recursive list copies of the same-named entries of ``G``,
+    ``regions`` lists the region dicts in id order and ``adjacency`` is
+    the edge list. All containers are JSON-compatible, ``None`` is
+    preserved and no value is rounded.
+    """
+    grid = robust_policy_grid_turns(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+    budget_values = _recursive_list_copy(grid["budgets"])
+    z_values = _recursive_list_copy(grid["z"])
+    states = _recursive_list_copy(grid["states"])
+    n_budgets = len(budget_values)
+    n_zs = len(z_values)
+
+    assigned = [[False] * n_zs for _ in range(n_budgets)]
+    regions: list[dict] = []
+    for b in range(n_budgets):
+        for r in range(n_zs):
+            if assigned[b][r]:
+                continue
+            state = states[b][r]
+            assigned[b][r] = True
+            cells: list[tuple[int, int]] = []
+            stack = [(b, r)]
+            while stack:
+                cb, cr = stack.pop()
+                cells.append((cb, cr))
+                for nb, nr in (
+                    (cb - 1, cr), (cb + 1, cr), (cb, cr - 1), (cb, cr + 1)
+                ):
+                    if (
+                        0 <= nb < n_budgets
+                        and 0 <= nr < n_zs
+                        and not assigned[nb][nr]
+                        and states[nb][nr] == state
+                    ):
+                        assigned[nb][nr] = True
+                        stack.append((nb, nr))
+            cells.sort()
+            member_bs = [cell[0] for cell in cells]
+            member_rs = [cell[1] for cell in cells]
+            regions.append(
+                {
+                    "id": len(regions),
+                    "cells": [[cb, cr] for cb, cr in cells],
+                    "budget_bounds": [
+                        budget_values[min(member_bs)],
+                        budget_values[max(member_bs)],
+                    ],
+                    "z_bounds": [
+                        z_values[min(member_rs)],
+                        z_values[max(member_rs)],
+                    ],
+                    "state": _recursive_list_copy(state),
+                }
+            )
+
+    cell_region = [[-1] * n_zs for _ in range(n_budgets)]
+    for region in regions:
+        for cb, cr in region["cells"]:
+            cell_region[cb][cr] = region["id"]
+
+    edges: set[tuple[int, int]] = set()
+    for b in range(n_budgets):
+        for r in range(n_zs):
+            for nb, nr in ((b + 1, r), (b, r + 1)):
+                if nb < n_budgets and nr < n_zs:
+                    first = cell_region[b][r]
+                    second = cell_region[nb][nr]
+                    if first != second:
+                        edges.add((min(first, second), max(first, second)))
+    adjacency = [[first, second] for first, second in sorted(edges)]
+
+    return {
+        "budgets": budget_values,
+        "z": z_values,
+        "states": states,
+        "regions": regions,
+        "adjacency": adjacency,
     }
 
 
