@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_grid",
+    "robust_policy_grid_turns",
     "robust_policy_report",
     "robust_policy_sensitivity",
     "sensitivity",
@@ -8902,6 +8903,108 @@ def robust_policy_grid(
         "stability": stability,
         "rank_changes": rank_changes,
         "level_changes": level_changes,
+    }
+
+
+def robust_policy_grid_turns(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Turning points of the robust grid state along both axes.
+
+    Every parameter shares the contract of :func:`robust_policy_grid`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim;
+    exceptions propagate unchanged). :func:`robust_policy_grid` is
+    called exactly once to obtain the grid ``G``.
+
+    The state ``S[b][r]`` is ``[choice copy, policy, robustness[2]
+    copy, warning[1] copy]`` taken from ``G["reports"][b][r]``: the
+    plan, the policy, the per-weight-set ranks and the per-quantile
+    warning levels. Adjacent states along the ``z`` axis are compared
+    in ascending ``b`` then ``r = 1..Z - 1`` order, and adjacent states
+    along the ``budget`` axis in ``b = 1..B - 1`` then ascending ``r``
+    order. Whenever two adjacent states differ, an event
+    ``[[before_b, before_r], [after_b, after_r], before_state,
+    after_state, fields]`` is recorded, where ``fields`` names the
+    changed components in the order ``choice``, ``policy``, ``ranks``,
+    ``levels``.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``states``, ``z_changes`` and ``budget_changes``: the first two are
+    float list copies of the same-named entries of ``G``, ``states`` is
+    the B x Z state matrix and the last two are the event lists in the
+    scan orders above, empty when nothing changes or the axis has a
+    single point; every change is kept. All containers are
+    JSON-compatible and no value is rounded.
+    """
+    grid = robust_policy_grid(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+    reports = grid["reports"]
+    n_budgets = len(grid["budgets"])
+    n_zs = len(grid["z"])
+
+    states: list[list[list]] = [
+        [
+            [
+                list(report["choice"]),
+                report["policy"],
+                list(report["robustness"][2]),
+                list(report["warning"][1]),
+            ]
+            for report in row
+        ]
+        for row in reports
+    ]
+
+    field_names = ("choice", "policy", "ranks", "levels")
+
+    def _turn(
+        before: list, after: list, b0: int, r0: int, b1: int, r1: int
+    ) -> list | None:
+        fields = [
+            name
+            for name, old, new in zip(field_names, before, after)
+            if old != new
+        ]
+        if not fields:
+            return None
+        return [
+            [b0, r0],
+            [b1, r1],
+            [list(before[0]), before[1], list(before[2]), list(before[3])],
+            [list(after[0]), after[1], list(after[2]), list(after[3])],
+            fields,
+        ]
+
+    z_changes: list[list] = []
+    for b in range(n_budgets):
+        for r in range(1, n_zs):
+            event = _turn(states[b][r - 1], states[b][r], b, r - 1, b, r)
+            if event is not None:
+                z_changes.append(event)
+
+    budget_changes: list[list] = []
+    for b in range(1, n_budgets):
+        for r in range(n_zs):
+            event = _turn(states[b - 1][r], states[b][r], b - 1, r, b, r)
+            if event is not None:
+                budget_changes.append(event)
+
+    return {
+        "budgets": list(grid["budgets"]),
+        "z": list(grid["z"]),
+        "states": states,
+        "z_changes": z_changes,
+        "budget_changes": budget_changes,
     }
 
 
