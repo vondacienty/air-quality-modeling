@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_grid",
+    "robust_policy_grid_turns",
     "robust_policy_report",
     "robust_policy_sensitivity",
     "sensitivity",
@@ -8902,6 +8903,105 @@ def robust_policy_grid(
         "stability": stability,
         "rank_changes": rank_changes,
         "level_changes": level_changes,
+    }
+
+
+def robust_policy_grid_turns(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Turning points of the robust plan and policy picks over the grid.
+
+    Every parameter shares the contract of :func:`robust_policy_grid`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim;
+    exceptions propagate unchanged). The function calls
+    :func:`robust_policy_grid` exactly once with all arguments unchanged
+    and takes the result as ``G``. The state of cell ``(b, r)`` is
+    ``S[b][r] = [choice, policy, ranks, levels]`` taken from
+    ``G["reports"][b][r]``: a list copy of ``choice``, ``policy``, a
+    list copy of ``robustness[2]`` and a list copy of ``warning[1]``.
+
+    Neighbouring states are compared along each axis: along ``z`` for
+    ``b`` ascending and then ``r = 1..Z - 1`` (``S[b][r - 1]`` against
+    ``S[b][r]``), and along ``budget`` for ``b = 1..B - 1`` and then
+    ``r`` ascending (``S[b - 1][r]`` against ``S[b][r]``). Only when the
+    two states differ an event
+    ``[[b_before, r_before], [b_after, r_after], state_before,
+    state_after, fields]`` is recorded, where ``fields`` names the
+    changed components in the fixed order ``choice``, ``policy``,
+    ``ranks``, ``levels``. Every change is kept; an axis with a single
+    point yields an empty event list.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``states``, ``z_changes`` and ``budget_changes``, with values float
+    list copies of ``G["budgets"]`` and ``G["z"]``, the B x Z state
+    matrix ``S`` and the two event lists in the scan orders above.
+    Everything follows the ``budgets``/``zs`` order and the original
+    ``weight_sets``/``quantiles`` order; all containers are
+    JSON-compatible and no value is rounded.
+    """
+    grid = robust_policy_grid(
+        H, W, thresholds, quantiles, policies, options, budgets, weight_sets, zs
+    )
+
+    states: list[list[list]] = [
+        [
+            [
+                list(report["choice"]),
+                report["policy"],
+                list(report["robustness"][2]),
+                list(report["warning"][1]),
+            ]
+            for report in row
+        ]
+        for row in grid["reports"]
+    ]
+
+    n_budgets = len(grid["budgets"])
+    n_zs = len(grid["z"])
+
+    def _event(before_at: list, after_at: list, before: list, after: list) -> list:
+        fields = [
+            name
+            for name, index in (
+                ("choice", 0),
+                ("policy", 1),
+                ("ranks", 2),
+                ("levels", 3),
+            )
+            if before[index] != after[index]
+        ]
+        return [before_at, after_at, before, after, fields]
+
+    z_changes: list[list] = []
+    for b in range(n_budgets):
+        for r in range(1, n_zs):
+            before = states[b][r - 1]
+            after = states[b][r]
+            if before != after:
+                z_changes.append(_event([b, r - 1], [b, r], before, after))
+
+    budget_changes: list[list] = []
+    for b in range(1, n_budgets):
+        for r in range(n_zs):
+            before = states[b - 1][r]
+            after = states[b][r]
+            if before != after:
+                budget_changes.append(_event([b - 1, r], [b, r], before, after))
+
+    return {
+        "budgets": list(grid["budgets"]),
+        "z": list(grid["z"]),
+        "states": states,
+        "z_changes": z_changes,
+        "budget_changes": budget_changes,
     }
 
 
