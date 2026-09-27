@@ -71,6 +71,7 @@ __all__ = [
     "risk_interval",
     "risk_probability",
     "risk_share",
+    "robust_policy_grid",
     "robust_policy_report",
     "robust_policy_sensitivity",
     "sensitivity",
@@ -8657,6 +8658,38 @@ def robust_policy_report(
     }
 
 
+def _validate_strictly_increasing(name: str, values: object) -> list[float]:
+    """Validate a non-empty, strictly increasing non-negative scalar axis."""
+    if not isinstance(values, (list, tuple)):
+        raise TypeError(
+            f"{name} must be a list or tuple, got {type(values).__name__}"
+        )
+    if len(values) == 0:
+        raise ValueError(f"{name} must not be empty")
+    result: list[float] = []
+    for r, item in enumerate(values):
+        if not _is_number(item):
+            raise TypeError(
+                f"{name}[{r}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        try:
+            value = float(item)
+        except OverflowError:
+            raise ValueError(
+                f"{name}[{r}] must be finite, got {item!r}"
+            ) from None
+        _check_finite(f"{name}[{r}]", value)
+        if value < 0:
+            raise ValueError(f"{name}[{r}] must be >= 0, got {value!r}")
+        if r > 0 and value <= result[r - 1]:
+            raise ValueError(
+                f"{name} must be strictly increasing, got {[*result, value]!r}"
+            )
+        result.append(value)
+    return result
+
+
 def robust_policy_sensitivity(
     H: list[list[float]] | tuple[tuple[float, ...], ...],
     W: list[list[float]] | tuple[tuple[float, ...], ...],
@@ -8676,7 +8709,8 @@ def robust_policy_sensitivity(
     non-empty list or tuple of non-bool, finite, non-negative int/float
     values in strictly increasing order; a wrong container or element
     type raises ``TypeError``, while an empty ``zs``, a non-finite or
-    negative entry or a non-increasing pair raises ``ValueError``.
+    negative entry, an int too large to convert to float or a
+    non-increasing pair raises ``ValueError``.
 
     For each ``z`` in ``zs`` order the function calls
     :func:`robust_policy_report` exactly once with every other argument
@@ -8696,28 +8730,7 @@ def robust_policy_sensitivity(
     ``weight_sets``/``quantiles`` order; all containers are
     JSON-compatible, ``None`` is preserved and no value is rounded.
     """
-    if not isinstance(zs, (list, tuple)):
-        raise TypeError(
-            f"zs must be a list or tuple, got {type(zs).__name__}"
-        )
-    if len(zs) == 0:
-        raise ValueError("zs must not be empty")
-    z_values: list[float] = []
-    for r, item in enumerate(zs):
-        if not _is_number(item):
-            raise TypeError(
-                f"zs[{r}] must be an int or float, "
-                f"got {type(item).__name__}"
-            )
-        value = float(item)
-        _check_finite(f"zs[{r}]", value)
-        if value < 0:
-            raise ValueError(f"zs[{r}] must be >= 0, got {value!r}")
-        if r > 0 and value <= z_values[r - 1]:
-            raise ValueError(
-                f"zs must be strictly increasing, got {[*z_values, value]!r}"
-            )
-        z_values.append(value)
+    z_values = _validate_strictly_increasing("zs", zs)
 
     reports = [
         robust_policy_report(
@@ -8763,6 +8776,130 @@ def robust_policy_sensitivity(
         "z": z_values,
         "reports": reports,
         "selection_counts": selection_counts,
+        "rank_changes": rank_changes,
+        "level_changes": level_changes,
+    }
+
+
+def robust_policy_grid(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Grid of robust plan and policy picks over budgets and interval widths.
+
+    Every parameter except ``budgets`` and ``zs`` shares the contract of
+    :func:`robust_policy_report` (every ``TypeError`` and ``ValueError``
+    is inherited verbatim; exceptions propagate unchanged). ``budgets``
+    and ``zs`` each follow the ``zs`` contract of
+    :func:`robust_policy_sensitivity`: a non-empty list or tuple of
+    non-bool, finite, non-negative int/float values in strictly
+    increasing order; a wrong container or element type raises
+    ``TypeError``, while an empty axis, a non-finite or negative entry,
+    an int too large to convert to float or a non-increasing pair raises
+    ``ValueError``.
+
+    With ``budgets`` as the outer axis and ``zs`` as the inner axis the
+    function calls :func:`robust_policy_report` exactly once per
+    ``(budget, z)`` cell with every other argument unchanged and
+    collects the results as the B x Z matrix ``R``. ``stability[b]``
+    holds, in ``z`` order, the maximal consecutive segments of reports
+    with an identical ``(choice, policy)`` pair, one
+    ``[first_z, last_z, choice, policy]`` entry per segment with
+    ``choice`` a list copy. ``rank_changes`` and ``level_changes`` are
+    dicts whose keys in order are ``z`` and ``budget``: the ``z`` value
+    is the B x (Z - 1) matrix of element-wise differences of
+    ``R[b][r + 1]`` minus ``R[b][r]`` over ``robustness[2]`` and
+    ``warning[1]`` respectively, and the ``budget`` value is the
+    (B - 1) x Z matrix of the same differences of ``R[b + 1][r]`` minus
+    ``R[b][r]``; an axis with a single point yields an empty dimension.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``reports``, ``stability``, ``rank_changes`` and ``level_changes``,
+    with values ``budgets`` and ``zs`` converted to floats, ``R``, the
+    per-budget segment lists and the two change dicts. Everything
+    follows the ``budgets``/``zs`` order and the original
+    ``weight_sets``/``quantiles`` order; all containers are
+    JSON-compatible, ``None`` is preserved and no value is rounded.
+    """
+    budget_values = _validate_strictly_increasing("budgets", budgets)
+    z_values = _validate_strictly_increasing("zs", zs)
+
+    reports = [
+        [
+            robust_policy_report(
+                H, W, thresholds, quantiles, policies, options,
+                budget, weight_sets, z,
+            )
+            for z in z_values
+        ]
+        for budget in budget_values
+    ]
+
+    stability: list[list[list]] = []
+    for row in reports:
+        segments: list[list] = []
+        for z_value, report in zip(z_values, row):
+            if (
+                segments
+                and segments[-1][2] == report["choice"]
+                and segments[-1][3] == report["policy"]
+            ):
+                segments[-1][1] = z_value
+            else:
+                segments.append(
+                    [z_value, z_value, list(report["choice"]), report["policy"]]
+                )
+        stability.append(segments)
+
+    def _changes(select) -> dict:
+        return {
+            "z": [
+                [
+                    [
+                        after - before
+                        for before, after in zip(
+                            select(row[r]), select(row[r + 1])
+                        )
+                    ]
+                    for r in range(len(z_values) - 1)
+                ]
+                for row in reports
+            ],
+            "budget": [
+                [
+                    [
+                        after - before
+                        for before, after in zip(
+                            select(reports[b][r]), select(reports[b + 1][r])
+                        )
+                    ]
+                    for r in range(len(z_values))
+                ]
+                for b in range(len(budget_values) - 1)
+            ],
+        }
+
+    def _robustness_ranks(report: dict) -> list:
+        return report["robustness"][2]
+
+    def _warning_levels(report: dict) -> list:
+        return report["warning"][1]
+
+    rank_changes = _changes(_robustness_ranks)
+    level_changes = _changes(_warning_levels)
+
+    return {
+        "budgets": budget_values,
+        "z": z_values,
+        "reports": reports,
+        "stability": stability,
         "rank_changes": rank_changes,
         "level_changes": level_changes,
     }
