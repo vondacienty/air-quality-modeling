@@ -74,6 +74,7 @@ __all__ = [
     "robust_policy_grid",
     "robust_policy_grid_regions",
     "robust_policy_grid_turns",
+    "robust_policy_region_flow",
     "robust_policy_report",
     "robust_policy_sensitivity",
     "sensitivity",
@@ -9139,6 +9140,260 @@ def robust_policy_grid_regions(
         "states": _copy(grid_states),
         "regions": regions,
         "adjacency": adjacency,
+    }
+
+
+def robust_policy_region_flow(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Flow of equal-state regions across the budget and z slices.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_grid_regions` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_grid_regions` is called exactly
+    once to obtain the grid ``G``; its regions give every cell
+    ``[b, r]`` an id, and those ids form a B x Z mesh.
+
+    A fixed-budget slice (one row, swept over ``r``) and a fixed-z slice
+    (one column, swept over ``b``) are each compressed into the maximal
+    runs of consecutive cells with one id; a run is
+    ``[first, last, id, state_copy]`` with ``first`` and ``last`` the
+    sweep indices at the run's ends and ``state_copy`` a recursive list
+    copy of that region's state. Within one slice every run gets one
+    ascending index in sweep order.
+
+    Two runs from adjacent slices are joined when they share an id and
+    their index intervals intersect (their shared cells touch across
+    the slice boundary). The join graph between two ordered run lists
+    is bipartite; its connected components are taken in the order of
+    their earliest run, isolated runs included. A component with
+    ``n_prev`` runs on the earlier slice and ``n_next`` runs on the
+    later one yields one event ``[kind, from, to, overlap]``: ``from``
+    and ``to`` are ascending run-index lists on the respective slices,
+    ``overlap`` is the sorted union without duplicates of the edge-wise
+    intersection coordinates (the ``r`` indices for a budget slice and
+    the ``b`` indices for a z slice), and ``kind`` is one of ``enter``
+    (0 -> many), ``exit`` (many -> 0), ``continue`` (1 -> 1), ``split``
+    (1 -> many), ``merge`` (many -> 1) and ``merge_split``
+    (many -> many).
+
+    Within a slice the adjacent different-id cell pairs form a
+    deduplicated, ascending edge set. Each pair of adjacent slices is
+    recorded as ``[earlier, later, added_edges, removed_edges]`` with
+    the two edge sets differenced.
+
+    Returns a dict whose keys in order are ``budgets``, ``z`` and
+    ``axes``: the first two are copies of the same-named entries of
+    ``G``, and ``axes`` is a dict whose keys in order are ``budget``
+    and ``z``. Each axis value is a dict whose keys in order are
+    ``slices``, ``events`` and ``adjacency_changes``: ``slices`` lists,
+    per slice, the run lists above; ``events`` lists, per pair of
+    adjacent slices, the component events; and ``adjacency_changes``
+    lists the per-pair edge-set differences. All containers are
+    JSON-compatible, ``None`` is preserved and no value is rounded.
+    """
+    grid = robust_policy_grid_regions(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+    budget_values = grid["budgets"]
+    z_values = grid["z"]
+    n_budgets = len(budget_values)
+    n_zs = len(z_values)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    # Id mesh rebuilt from G's regions: each region's cells share an id.
+    id_mesh: list[list[int]] = [
+        [0 for _r in range(n_zs)] for _b in range(n_budgets)
+    ]
+    state_of: dict[int, object] = {}
+    for region in grid["regions"]:
+        region_id = region["id"]
+        state_of[region_id] = region["state"]
+        for b, r in region["cells"]:
+            id_mesh[b][r] = region_id
+
+    def _runs(line: list[int]) -> list[list]:
+        runs: list[list] = []
+        for index, region_id in enumerate(line):
+            if runs and runs[-1][2] == region_id:
+                runs[-1][1] = index
+            else:
+                runs.append(
+                    [
+                        index,
+                        index,
+                        region_id,
+                        _copy(state_of[region_id]),
+                    ]
+                )
+        return runs
+
+    def _edges(line: list[int]) -> list[list[int]]:
+        edge_set: set[tuple[int, int]] = set()
+        for index in range(len(line) - 1):
+            left = line[index]
+            right = line[index + 1]
+            if left != right:
+                edge_set.add(
+                    (left, right) if left < right else (right, left)
+                )
+        return [[small, large] for small, large in sorted(edge_set)]
+
+    kind_by_shape = {
+        (0, 1): "enter",
+        (1, 0): "exit",
+        (1, 1): "continue",
+        (1, 2): "split",
+        (2, 1): "merge",
+        (2, 2): "merge_split",
+    }
+
+    def _events(
+        prev_runs: list[list],
+        next_runs: list[list],
+    ) -> list[list]:
+        # Bipartite joins: edge (prev run index, next run index) when the
+        # two runs share an id and their index intervals intersect.
+        links: list[set[int]] = [set() for _ in prev_runs]
+        back_links: list[set[int]] = [set() for _ in next_runs]
+        overlap_of: dict[tuple[int, int], list[int]] = {}
+        for pi, run in enumerate(prev_runs):
+            p_first, p_last, p_id, _ = run
+            for ni, other in enumerate(next_runs):
+                n_first, n_last, n_id, _ = other
+                if p_id != n_id:
+                    continue
+                lo = max(p_first, n_first)
+                hi = min(p_last, n_last)
+                if lo > hi:
+                    continue
+                links[pi].add(ni)
+                back_links[ni].add(pi)
+                overlap_of[(pi, ni)] = list(range(lo, hi + 1))
+
+        # Connected components of the bipartite join graph.
+        seen_prev: set[int] = set()
+        seen_next: set[int] = set()
+        seeds: list[tuple[str, int]] = []
+        for pi in range(len(prev_runs)):
+            seeds.append(("p", pi))
+        for ni in range(len(next_runs)):
+            seeds.append(("n", ni))
+
+        events: list[list] = []
+        for side, seed in seeds:
+            if side == "p" and seed in seen_prev:
+                continue
+            if side == "n" and seed in seen_next:
+                continue
+            prev_members: set[int] = set()
+            next_members: set[int] = set()
+            pending: list[tuple[str, int]] = [(side, seed)]
+            if side == "p":
+                seen_prev.add(seed)
+            else:
+                seen_next.add(seed)
+            while pending:
+                cur_side, index = pending.pop()
+                if cur_side == "p":
+                    prev_members.add(index)
+                    for ni in links[index]:
+                        if ni not in seen_next:
+                            seen_next.add(ni)
+                            pending.append(("n", ni))
+                else:
+                    next_members.add(index)
+                    for pi in back_links[index]:
+                        if pi not in seen_prev:
+                            seen_prev.add(pi)
+                            pending.append(("p", pi))
+
+            from_idx = sorted(prev_members)
+            to_idx = sorted(next_members)
+
+            def _side(count: int) -> int:
+                return 0 if count == 0 else (1 if count == 1 else 2)
+
+            kind = kind_by_shape[(_side(len(from_idx)), _side(len(to_idx)))]
+
+            overlap_values: set[int] = set()
+            for pi in from_idx:
+                for ni in to_idx:
+                    overlap_values.update(overlap_of.get((pi, ni), ()))
+            overlap = sorted(overlap_values)
+            events.append([kind, from_idx, to_idx, overlap])
+
+        return events
+
+    def _axis(
+        slices: list[list[int]],
+    ) -> tuple[list[list[list]], list[list[list]], list[list]]:
+        run_lists = [_runs(line) for line in slices]
+        edge_lists = [_edges(line) for line in slices]
+
+        events_per_pair: list[list[list]] = []
+        adjacency_changes: list[list] = []
+        for index in range(len(slices) - 1):
+            events_per_pair.append(
+                _events(run_lists[index], run_lists[index + 1])
+            )
+            before = {
+                (edge[0], edge[1]) for edge in edge_lists[index]
+            }
+            after = {
+                (edge[0], edge[1]) for edge in edge_lists[index + 1]
+            }
+            added = [
+                [small, large]
+                for small, large in sorted(after - before)
+            ]
+            removed = [
+                [small, large]
+                for small, large in sorted(before - after)
+            ]
+            adjacency_changes.append([index, index + 1, added, removed])
+
+        return run_lists, events_per_pair, adjacency_changes
+
+    # Budget slices: fixed b, swept over r.
+    budget_slice_lines = [list(id_mesh[b]) for b in range(n_budgets)]
+    budget_slices, budget_events, budget_changes = _axis(budget_slice_lines)
+
+    # z slices: fixed r, swept over b.
+    z_slice_lines = [
+        [id_mesh[b][r] for b in range(n_budgets)] for r in range(n_zs)
+    ]
+    z_slices, z_events, z_changes = _axis(z_slice_lines)
+
+    return {
+        "budgets": list(budget_values),
+        "z": list(z_values),
+        "axes": {
+            "budget": {
+                "slices": budget_slices,
+                "events": budget_events,
+                "adjacency_changes": budget_changes,
+            },
+            "z": {
+                "slices": z_slices,
+                "events": z_events,
+                "adjacency_changes": z_changes,
+            },
+        },
     }
 
 
