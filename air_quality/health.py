@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_report",
+    "robust_policy_sensitivity",
     "sensitivity",
 ]
 
@@ -8653,6 +8654,117 @@ def robust_policy_report(
             _as_lists(item)
             for item in (runs, levels, warning_triggers, first, cumulative)
         ],
+    }
+
+
+def robust_policy_sensitivity(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budget: float,
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Sensitivity of the robust plan and policy pick to the interval width.
+
+    Every parameter except ``zs`` shares the contract of
+    :func:`robust_policy_report` (every ``TypeError`` and ``ValueError``
+    is inherited verbatim; exceptions propagate unchanged). ``zs`` is a
+    non-empty list or tuple of non-bool, finite, non-negative int/float
+    values in strictly increasing order; a wrong container or element
+    type raises ``TypeError``, while an empty ``zs``, a non-finite or
+    negative entry or a non-increasing pair raises ``ValueError``.
+
+    For each ``z`` in ``zs`` order the function calls
+    :func:`robust_policy_report` exactly once with every other argument
+    unchanged and collects the results as ``R``. Reports with an
+    identical ``(choice, policy)`` pair are grouped; ``S`` holds, in
+    first-occurrence order, one ``[choice, policy, count]`` entry per
+    group with ``choice`` a list copy. Row ``r`` of ``D`` is the
+    element-wise difference of ``R[r + 1]["robustness"][2]`` and
+    ``R[r]["robustness"][2]``; row ``r`` of ``G`` is the element-wise
+    difference of ``R[r + 1]["warning"][1]`` and ``R[r]["warning"][1]``.
+    With a single ``z`` both ``D`` and ``G`` are empty.
+
+    Returns a dict whose keys in order are ``z``, ``reports``,
+    ``selection_counts``, ``rank_changes`` and ``level_changes``, with
+    values ``zs`` converted to floats, ``R``, ``S``, ``D`` and ``G``.
+    Everything follows the ``zs`` order and the original
+    ``weight_sets``/``quantiles`` order; all containers are
+    JSON-compatible, ``None`` is preserved and no value is rounded.
+    """
+    if not isinstance(zs, (list, tuple)):
+        raise TypeError(
+            f"zs must be a list or tuple, got {type(zs).__name__}"
+        )
+    if len(zs) == 0:
+        raise ValueError("zs must not be empty")
+    z_values: list[float] = []
+    for r, item in enumerate(zs):
+        if not _is_number(item):
+            raise TypeError(
+                f"zs[{r}] must be an int or float, "
+                f"got {type(item).__name__}"
+            )
+        value = float(item)
+        _check_finite(f"zs[{r}]", value)
+        if value < 0:
+            raise ValueError(f"zs[{r}] must be >= 0, got {value!r}")
+        if r > 0 and value <= z_values[r - 1]:
+            raise ValueError(
+                f"zs must be strictly increasing, got {[*z_values, value]!r}"
+            )
+        z_values.append(value)
+
+    reports = [
+        robust_policy_report(
+            H, W, thresholds, quantiles, policies, options, budget,
+            weight_sets, z,
+        )
+        for z in z_values
+    ]
+
+    selection_counts: list[list] = []
+    group_index: dict[tuple, int] = {}
+    for report in reports:
+        key = (tuple(report["choice"]), report["policy"])
+        index = group_index.get(key)
+        if index is None:
+            group_index[key] = len(selection_counts)
+            selection_counts.append(
+                [list(report["choice"]), report["policy"], 1]
+            )
+        else:
+            selection_counts[index][2] += 1
+
+    rank_changes: list[list[float]] = [
+        [
+            after - before
+            for before, after in zip(
+                reports[r]["robustness"][2], reports[r + 1]["robustness"][2]
+            )
+        ]
+        for r in range(len(reports) - 1)
+    ]
+    level_changes: list[list[float]] = [
+        [
+            after - before
+            for before, after in zip(
+                reports[r]["warning"][1], reports[r + 1]["warning"][1]
+            )
+        ]
+        for r in range(len(reports) - 1)
+    ]
+
+    return {
+        "z": z_values,
+        "reports": reports,
+        "selection_counts": selection_counts,
+        "rank_changes": rank_changes,
+        "level_changes": level_changes,
     }
 
 
