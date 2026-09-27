@@ -74,6 +74,7 @@ __all__ = [
     "robust_policy_grid",
     "robust_policy_grid_regions",
     "robust_policy_grid_turns",
+    "robust_policy_region_flow",
     "robust_policy_report",
     "robust_policy_sensitivity",
     "sensitivity",
@@ -9139,6 +9140,281 @@ def robust_policy_grid_regions(
         "states": _copy(grid_states),
         "regions": regions,
         "adjacency": adjacency,
+    }
+
+
+def robust_policy_region_flow(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Bipartite flow of the equal-state regions between adjacent slices.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_grid_regions` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_grid_regions` is called exactly
+    once to obtain the grid ``G``; an id grid is built from the region
+    ``cells`` of ``G`` (a cell ``[b, r]`` carries its region ``id``).
+
+    A budget slice fixes ``b`` and scans ``r``; a z slice fixes ``r``
+    and scans ``b``. Inside each slice the maximal consecutive runs of
+    one id are segments, recorded as
+    ``[first_coordinate, last_coordinate, id, state_copy]`` with
+    ``state_copy`` a recursive list copy of ``G["states"]`` at the
+    segment's cells; segment indices ascend with the slice. Two
+    segments of neighbouring slices that share an id and whose
+    coordinate intervals overlap are linked. The links form a
+    bipartite graph between the two ordered segment sides; its
+    connected components, including isolated segments as singleton
+    components, are found. Each component becomes an event
+    ``[kind, from_segments, to_segments, overlap]``, where
+    ``from_segments`` and ``to_segments`` are ascending segment
+    indices and ``overlap`` is the deduplicated, ascending list of the
+    intersecting coordinates of every link (empty for an isolated
+    segment). ``kind`` is ``enter`` for 0-to-many, ``exit`` for
+    many-to-0, ``continue`` for 1-to-1, ``split`` for 1-to-many,
+    ``merge`` for many-to-1 and ``merge_split`` for many-to-many.
+    Along the budget axis the pairs are the slices at ``b`` and
+    ``b + 1`` in ascending ``b``; along the z axis the pairs are the
+    slices at ``r`` and ``r + 1`` in ascending ``r``. Events follow
+    the front then back segment order.
+
+    Within one slice the adjacent cells with different ids form an
+    edge ``[smaller id, larger id]``; the set is deduplicated and
+    sorted by the two ids. For each pair of adjacent slices an entry
+    ``[front_slice, back_slice, added_edges, removed_edges]`` compares
+    the two edge sets, both sorted by the two ids.
+
+    Returns a dict whose keys in order are ``budgets``, ``z`` and
+    ``axes``: the first two are list copies of the same-named entries
+    of ``G``, and ``axes`` is a dict whose keys in order are ``budget``
+    and ``z``, each a dict whose keys in order are ``slices``,
+    ``events`` and ``adjacency_changes``. All containers are
+    JSON-compatible, ``None`` is preserved and no value is rounded.
+    """
+    grid = robust_policy_grid_regions(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+    budget_values = list(grid["budgets"])
+    z_values = list(grid["z"])
+    grid_states = grid["states"]
+    n_budgets = len(budget_values)
+    n_zs = len(z_values)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    id_grid: list[list[int]] = [
+        [0 for _ in range(n_zs)] for _ in range(n_budgets)
+    ]
+    for region in grid["regions"]:
+        region_id = region["id"]
+        for b, r in region["cells"]:
+            id_grid[b][r] = region_id
+
+    def _state_at(b: int, r: int) -> list:
+        return _copy(grid_states[b][r])
+
+    def _segments_in_budget_slice(b: int) -> list[list]:
+        # Fix b and scan r.
+        segments: list[list] = []
+        for r in range(n_zs):
+            region_id = id_grid[b][r]
+            if segments and segments[-1][2] == region_id:
+                segments[-1][1] = r
+            else:
+                segments.append([r, r, region_id, _state_at(b, r)])
+        return segments
+
+    def _segments_in_z_slice(r: int) -> list[list]:
+        # Fix r and scan b.
+        segments: list[list] = []
+        for b in range(n_budgets):
+            region_id = id_grid[b][r]
+            if segments and segments[-1][2] == region_id:
+                segments[-1][1] = b
+            else:
+                segments.append([b, b, region_id, _state_at(b, r)])
+        return segments
+
+    def _flow_events(
+        before: list[list], after: list[list]
+    ) -> list[list]:
+        by_id_before: dict[int, list[int]] = {}
+        by_id_after: dict[int, list[int]] = {}
+        for index, segment in enumerate(before):
+            by_id_before.setdefault(segment[2], []).append(index)
+        for index, segment in enumerate(after):
+            by_id_after.setdefault(segment[2], []).append(index)
+
+        links: list[tuple[int, int, list[int]]] = []
+        for region_id, before_indices in by_id_before.items():
+            after_indices = by_id_after.get(region_id)
+            if not after_indices:
+                continue
+            for i in before_indices:
+                first_before, last_before = before[i][0], before[i][1]
+                for j in after_indices:
+                    first_after, last_after = after[j][0], after[j][1]
+                    low = max(first_before, first_after)
+                    high = min(last_before, last_after)
+                    if low <= high:
+                        links.append((i, j, list(range(low, high + 1))))
+
+        neighbours_before: dict[int, set[int]] = {
+            i: set() for i in range(len(before))
+        }
+        neighbours_after: dict[int, set[int]] = {
+            j: set() for j in range(len(after))
+        }
+        for i, j, _ in links:
+            neighbours_before[i].add(j)
+            neighbours_after[j].add(i)
+
+        seen_before: set[int] = set()
+        seen_after: set[int] = set()
+        events: list[list] = []
+        starts = [("before", i) for i in range(len(before))]
+        starts.extend(("after", j) for j in range(len(after)))
+        for start_side, start_index in starts:
+            if start_side == "before":
+                if start_index in seen_before:
+                    continue
+            elif start_index in seen_after:
+                continue
+
+            from_indices: list[int] = []
+            to_indices: list[int] = []
+            pending: list[tuple[str, int]] = [(start_side, start_index)]
+            while pending:
+                side, index = pending.pop()
+                if side == "before":
+                    if index in seen_before:
+                        continue
+                    seen_before.add(index)
+                    from_indices.append(index)
+                    for j in sorted(neighbours_before[index]):
+                        if j not in seen_after:
+                            pending.append(("after", j))
+                else:
+                    if index in seen_after:
+                        continue
+                    seen_after.add(index)
+                    to_indices.append(index)
+                    for i in sorted(neighbours_after[index]):
+                        if i not in seen_before:
+                            pending.append(("before", i))
+
+            overlap_set: set[int] = set()
+            from_set = set(from_indices)
+            to_set = set(to_indices)
+            for i, j, coordinates in links:
+                if i in from_set and j in to_set:
+                    overlap_set.update(coordinates)
+
+            from_indices.sort()
+            to_indices.sort()
+            n_from = len(from_indices)
+            n_to = len(to_indices)
+            if n_from == 0:
+                kind = "enter"
+            elif n_to == 0:
+                kind = "exit"
+            elif n_from == 1 and n_to == 1:
+                kind = "continue"
+            elif n_from == 1:
+                kind = "split"
+            elif n_to == 1:
+                kind = "merge"
+            else:
+                kind = "merge_split"
+            events.append(
+                [kind, from_indices, to_indices, sorted(overlap_set)]
+            )
+
+        return events
+
+    def _edge_set(ids: list[int]) -> set[tuple[int, int]]:
+        edges: set[tuple[int, int]] = set()
+        for coordinate in range(len(ids) - 1):
+            left = ids[coordinate]
+            right = ids[coordinate + 1]
+            if left != right:
+                edges.add(
+                    (left, right) if left < right else (right, left)
+                )
+        return edges
+
+    def _edge_changes(
+        front_ids: list[int], back_ids: list[int]
+    ) -> list[list[list[int]]]:
+        front_edges = _edge_set(front_ids)
+        back_edges = _edge_set(back_ids)
+        added = [
+            [small, large]
+            for small, large in sorted(back_edges - front_edges)
+        ]
+        removed = [
+            [small, large]
+            for small, large in sorted(front_edges - back_edges)
+        ]
+        return [added, removed]
+
+    budget_slices: list[list[list]] = []
+    budget_events: list[list] = []
+    budget_adjacency_changes: list[list] = []
+    for b in range(n_budgets):
+        current = _segments_in_budget_slice(b)
+        budget_slices.append(current)
+        if b + 1 < n_budgets:
+            following = _segments_in_budget_slice(b + 1)
+            budget_events.append(_flow_events(current, following))
+            added, removed = _edge_changes(
+                [id_grid[b][r] for r in range(n_zs)],
+                [id_grid[b + 1][r] for r in range(n_zs)],
+            )
+            budget_adjacency_changes.append([b, b + 1, added, removed])
+
+    z_slices: list[list[list]] = []
+    z_events: list[list] = []
+    z_adjacency_changes: list[list] = []
+    for r in range(n_zs):
+        current = _segments_in_z_slice(r)
+        z_slices.append(current)
+        if r + 1 < n_zs:
+            following = _segments_in_z_slice(r + 1)
+            z_events.append(_flow_events(current, following))
+            added, removed = _edge_changes(
+                [id_grid[b][r] for b in range(n_budgets)],
+                [id_grid[b][r + 1] for b in range(n_budgets)],
+            )
+            z_adjacency_changes.append([r, r + 1, added, removed])
+
+    return {
+        "budgets": budget_values,
+        "z": z_values,
+        "axes": {
+            "budget": {
+                "slices": budget_slices,
+                "events": budget_events,
+                "adjacency_changes": budget_adjacency_changes,
+            },
+            "z": {
+                "slices": z_slices,
+                "events": z_events,
+                "adjacency_changes": z_adjacency_changes,
+            },
+        },
     }
 
 
