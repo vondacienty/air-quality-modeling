@@ -74,6 +74,7 @@ __all__ = [
     "robust_policy_grid",
     "robust_policy_grid_regions",
     "robust_policy_grid_turns",
+    "robust_policy_lineage",
     "robust_policy_region_flow",
     "robust_policy_report",
     "robust_policy_sensitivity",
@@ -9393,6 +9394,230 @@ def robust_policy_region_flow(
                 "events": z_events,
                 "adjacency_changes": z_changes,
             },
+        },
+    }
+
+
+def robust_policy_lineage(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Node/transition lineage of region runs across both flow axes.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_region_flow` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_region_flow` is called exactly
+    once to obtain ``F``.
+
+    For each axis (``budget`` and ``z``) the runs of ``F`` are
+    flattened in slice order and, within each slice, in segment order.
+    Every run becomes one node ``[id, slice, segment, first, last,
+    region, state]`` with ``id`` ascending from zero across the axis,
+    ``slice``/``segment`` the run's slice and run indices, ``first``
+    and ``last`` the run's sweep-index interval, ``region`` its region
+    id and ``state`` a recursive list copy of the run's state.
+
+    The events of ``F`` are rewritten with node ids: each event becomes
+    one transition ``[kind, from, to, overlap]`` with the segment
+    indices of ``from``/``to`` mapped to node ids. A directed edge runs
+    from every ``from`` node to every ``to`` node whose region is the
+    same and whose index intervals intersect.
+
+    Connected components are taken over the undirected edge set (edge
+    directions ignored) and numbered by their smallest node id. A
+    lineage is ``[id, nodes, entries, exits, paths, changes]``:
+    ``nodes`` lists the component's node ids ascending; ``entries`` and
+    ``exits`` are the nodes with in-degree zero and out-degree zero;
+    ``paths`` are the maximal directed paths that cover every edge,
+    starting at each outgoing edge of a node whose in- and out-degree
+    are not both one and continuing through nodes with one incoming and
+    one outgoing edge; isolated nodes are listed as one-node paths.
+    All paths sort lexicographically. ``changes`` lists the non-empty
+    adjacency-change records of ``F`` for which at least one end of an
+    added or removed edge names a region appearing on a component node.
+
+    Returns a dict whose keys in order are ``budgets``, ``z`` and
+    ``axes``; ``axes`` has keys ``budget`` and ``z`` in that order, and
+    each axis value has keys ``nodes``, ``transitions`` and
+    ``lineages`` in that order. All containers are JSON-compatible,
+    ``None`` is preserved and no value is rounded.
+    """
+    flow = robust_policy_region_flow(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    def _axis(
+        slices: list[list[list]],
+        events_per_pair: list[list[list]],
+        adjacency_changes: list[list],
+    ) -> dict:
+        # Flatten runs: slice order, then segment order.
+        nodes: list[list] = []
+        node_of: dict[tuple[int, int], int] = {}
+        interval_of: dict[int, tuple[int, int]] = {}
+        region_of: dict[int, int] = {}
+        for slice_index, runs in enumerate(slices):
+            for segment_index, run in enumerate(runs):
+                first, last, region, state = run
+                node_id = len(nodes)
+                node_of[(slice_index, segment_index)] = node_id
+                interval_of[node_id] = (first, last)
+                region_of[node_id] = region
+                nodes.append(
+                    [
+                        node_id,
+                        slice_index,
+                        segment_index,
+                        first,
+                        last,
+                        region,
+                        _copy(state),
+                    ]
+                )
+
+        n_nodes = len(nodes)
+        parent = list(range(n_nodes))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            root_a = _find(a)
+            root_b = _find(b)
+            if root_a != root_b:
+                if root_a < root_b:
+                    parent[root_b] = root_a
+                else:
+                    parent[root_a] = root_b
+
+        transitions: list[list] = []
+        incoming: list[list[int]] = [[] for _ in range(n_nodes)]
+        outgoing: list[list[int]] = [[] for _ in range(n_nodes)]
+        for pair_index, events in enumerate(events_per_pair):
+            for kind, from_segments, to_segments, overlap in events:
+                from_ids = [
+                    node_of[(pair_index, segment)] for segment in from_segments
+                ]
+                to_ids = [
+                    node_of[(pair_index + 1, segment)]
+                    for segment in to_segments
+                ]
+                transitions.append(
+                    [kind, list(from_ids), list(to_ids), list(overlap)]
+                )
+                for source in from_ids:
+                    src_first, src_last = interval_of[source]
+                    for target in to_ids:
+                        if region_of[source] != region_of[target]:
+                            continue
+                        tgt_first, tgt_last = interval_of[target]
+                        if max(src_first, tgt_first) > min(src_last, tgt_last):
+                            continue
+                        outgoing[source].append(target)
+                        incoming[target].append(source)
+                        _union(source, target)
+
+        groups: dict[int, list[int]] = {}
+        for node_id in range(n_nodes):
+            groups.setdefault(_find(node_id), []).append(node_id)
+
+        lineages: list[list] = []
+        for lineage_id, root in enumerate(sorted(groups)):
+            members = sorted(groups[root])
+            member_set = set(members)
+            member_regions = {region_of[node_id] for node_id in members}
+
+            entries = [
+                node_id for node_id in members if not incoming[node_id]
+            ]
+            exits = [node_id for node_id in members if not outgoing[node_id]]
+
+            paths: list[list[int]] = []
+            for source in members:
+                if not outgoing[source]:
+                    continue
+                if len(incoming[source]) == 1 and len(outgoing[source]) == 1:
+                    continue
+                for target in sorted(outgoing[source]):
+                    path = [source]
+                    current = target
+                    while True:
+                        path.append(current)
+                        if (
+                            len(incoming[current]) == 1
+                            and len(outgoing[current]) == 1
+                        ):
+                            current = outgoing[current][0]
+                        else:
+                            break
+                    paths.append(path)
+            for node_id in members:
+                if not incoming[node_id] and not outgoing[node_id]:
+                    paths.append([node_id])
+            paths.sort()
+
+            changes: list[list] = []
+            for record in adjacency_changes:
+                earlier, later, added, removed = record
+                if not added and not removed:
+                    continue
+                touched = False
+                for edge in (added, removed):
+                    for small, large in edge:
+                        if (
+                            small in member_regions
+                            or large in member_regions
+                        ):
+                            touched = True
+                            break
+                    if touched:
+                        break
+                if touched:
+                    changes.append(
+                        [earlier, later, _copy(added), _copy(removed)]
+                    )
+
+            lineages.append(
+                [lineage_id, members, entries, exits, paths, changes]
+            )
+
+        return {
+            "nodes": nodes,
+            "transitions": transitions,
+            "lineages": lineages,
+        }
+
+    return {
+        "budgets": _copy(flow["budgets"]),
+        "z": _copy(flow["z"]),
+        "axes": {
+            "budget": _axis(
+                flow["axes"]["budget"]["slices"],
+                flow["axes"]["budget"]["events"],
+                flow["axes"]["budget"]["adjacency_changes"],
+            ),
+            "z": _axis(
+                flow["axes"]["z"]["slices"],
+                flow["axes"]["z"]["events"],
+                flow["axes"]["z"]["adjacency_changes"],
+            ),
         },
     }
 
