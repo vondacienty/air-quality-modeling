@@ -74,6 +74,7 @@ __all__ = [
     "robust_policy_grid",
     "robust_policy_grid_regions",
     "robust_policy_grid_turns",
+    "robust_policy_lineage",
     "robust_policy_region_flow",
     "robust_policy_report",
     "robust_policy_sensitivity",
@@ -9393,6 +9394,286 @@ def robust_policy_region_flow(
                 "events": z_events,
                 "adjacency_changes": z_changes,
             },
+        },
+    }
+
+
+def robust_policy_lineage(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Region lineages traced through the budget and z slice flows.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_region_flow` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_region_flow` is called exactly
+    once to obtain the flow ``F``.
+
+    Both axes flatten their slices in order (budget axis: slices in
+    budget order; z axis: slices in z order) and, within each slice,
+    the runs in sweep order. Every flattened run becomes one node in
+    this enumeration order, so node ids ascend globally from ``0``; a
+    node is ``[id, slice, run, first, last, region, state]`` with
+    ``slice`` the slice index, ``run`` the run index within the slice,
+    ``first`` and ``last`` that run's sweep-index ends, ``region`` its
+    region id and ``state`` a recursive list copy of the run's state.
+
+    Each event of ``F`` has its ``from`` and ``to`` run indices
+    replaced by the corresponding node ids. The transitions of a slice
+    pair are stored per pair as ``[kind, from, to, overlap]`` lists in
+    event order: ``from`` and ``to`` are the ascending node-id lists
+    and ``overlap`` is unchanged. A Cartesian from x to pair is an
+    edge exactly when its two nodes share a region and their sweep
+    intervals intersect.
+
+    Edges ignore direction when connected components are taken:
+    components are numbered by their smallest node id, ties resolved in
+    that order. A lineage is
+    ``[id, nodes, entries, exits, paths, changes]``: ``nodes`` lists
+    the component's node ids ascending; ``entries`` and ``exits`` are
+    the component nodes with in-degree zero and out-degree zero;
+    ``paths`` are the maximal directed paths that cover every edge and
+    whose interior nodes have in-degree and out-degree one each, with
+    an isolated node listed on its own; the paths are ordered
+    lexicographically. ``changes`` holds the non-empty adjacency
+    change records of ``F`` (the ``[earlier, later, added, removed]``
+    entries) for which at least one edge endpoint belongs to a region
+    touching the component.
+
+    Returns a dict whose keys in order are ``budgets``, ``z`` and
+    ``axes``: the first two are the same-named entries of ``F``, and
+    ``axes`` is a dict whose keys in order are ``budget`` and ``z``.
+    Each axis value is a dict whose keys in order are ``nodes``,
+    ``transitions`` and ``lineages``. All containers are
+    JSON-compatible, ``None`` is preserved and no value is rounded.
+    """
+    flow = robust_policy_region_flow(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    def _lineage_axis(axis: dict) -> dict:
+        slices = axis["slices"]
+        events_per_pair = axis["events"]
+        changes_per_pair = axis["adjacency_changes"]
+
+        # Flatten slices then runs; node ids ascend in this order.
+        nodes: list[list] = []
+        node_of: dict[tuple[int, int], int] = {}
+        info_of: dict[int, tuple[int, int, int, int, int]] = {}
+        for slice_index, runs in enumerate(slices):
+            for run_index, run in enumerate(runs):
+                first, last, region_id, state = run
+                node_id = len(nodes)
+                node_of[(slice_index, run_index)] = node_id
+                info_of[node_id] = (
+                    slice_index, run_index, first, last, region_id
+                )
+                nodes.append(
+                    [
+                        node_id,
+                        slice_index,
+                        run_index,
+                        first,
+                        last,
+                        region_id,
+                        _copy(state),
+                    ]
+                )
+
+        # Edges: Cartesian from x to with equal region and intersecting
+        # sweep intervals. Transition records mirror the flow events but
+        # reference node ids; the outer list stays per slice pair.
+        transitions: list[list[list]] = []
+        out_sets: dict[int, set[int]] = {}
+        in_sets: dict[int, set[int]] = {}
+
+        def _add_edge(source: int, target: int) -> None:
+            out_sets.setdefault(source, set()).add(target)
+            in_sets.setdefault(target, set()).add(source)
+
+        for pair_index, events in enumerate(events_per_pair):
+            pair_transitions: list[list] = []
+            for kind, from_idx, to_idx, overlap in events:
+                from_nodes = sorted(
+                    node_of[(pair_index, run_index)]
+                    for run_index in from_idx
+                )
+                to_nodes = sorted(
+                    node_of[(pair_index + 1, run_index)]
+                    for run_index in to_idx
+                )
+                pair_transitions.append(
+                    [kind, from_nodes, to_nodes, list(overlap)]
+                )
+                for source in from_nodes:
+                    _, _, s_first, s_last, s_region = info_of[source]
+                    for target in to_nodes:
+                        _, _, t_first, t_last, t_region = info_of[target]
+                        if s_region != t_region:
+                            continue
+                        if max(s_first, t_first) > min(s_last, t_last):
+                            continue
+                        _add_edge(source, target)
+            transitions.append(pair_transitions)
+
+        # Undirected connected components, numbered by smallest node id.
+        undirected: dict[int, set[int]] = {}
+        for source, targets in out_sets.items():
+            undirected.setdefault(source, set()).update(targets)
+            for target in targets:
+                undirected.setdefault(target, set()).add(source)
+        for node_id in range(len(nodes)):
+            undirected.setdefault(node_id, set())
+
+        assigned: dict[int, int] = {}
+        components: list[list[int]] = []
+        for seed in range(len(nodes)):
+            if seed in assigned:
+                continue
+            component_id = len(components)
+            members: list[int] = []
+            pending = [seed]
+            assigned[seed] = component_id
+            while pending:
+                current = pending.pop()
+                members.append(current)
+                for neighbour in undirected[current]:
+                    if neighbour not in assigned:
+                        assigned[neighbour] = component_id
+                        pending.append(neighbour)
+            members.sort()
+            components.append(members)
+        components.sort(key=lambda members: members[0])
+
+        # Regions touched by each component (its nodes' regions).
+        regions_of_component: list[set[int]] = [
+            {info_of[node_id][4] for node_id in members}
+            for members in components
+        ]
+        component_by_region: dict[int, set[int]] = {}
+        for component_id, region_ids in enumerate(
+            regions_of_component
+        ):
+            for region_id in region_ids:
+                component_by_region.setdefault(
+                    region_id, set()
+                ).add(component_id)
+
+        # Non-empty adjacency change records with an endpoint region
+        # touching the component.
+        changes_by_component: dict[int, list[list]] = {}
+        for record in changes_per_pair:
+            earlier, later, added, removed = record
+            if not added and not removed:
+                continue
+            entry = [
+                earlier,
+                later,
+                [list(edge) for edge in added],
+                [list(edge) for edge in removed],
+            ]
+            touched: set[int] = set()
+            for edge in added:
+                for region_id in edge:
+                    touched.update(
+                        component_by_region.get(region_id, ())
+                    )
+            for edge in removed:
+                for region_id in edge:
+                    touched.update(
+                        component_by_region.get(region_id, ())
+                    )
+            for component_id in touched:
+                changes_by_component.setdefault(
+                    component_id, []
+                ).append(entry)
+
+        lineages: list[list] = []
+        for component_id, members in enumerate(components):
+            member_set = set(members)
+            entries = sorted(
+                node_id
+                for node_id in members
+                if not (in_sets.get(node_id, set()) & member_set)
+            )
+            exits = sorted(
+                node_id
+                for node_id in members
+                if not (out_sets.get(node_id, set()) & member_set)
+            )
+
+            # Edges only join adjacent slices, so the directed graph is
+            # acyclic. Maximal paths start at every outgoing edge of a
+            # node that is not a degree-(1, 1) interior node, then follow
+            # the unique successor while the interior condition holds.
+            def _out(node_id: int) -> list[int]:
+                return sorted(
+                    out_sets.get(node_id, set()) & member_set
+                )
+
+            def _in(node_id: int) -> list[int]:
+                return sorted(
+                    in_sets.get(node_id, set()) & member_set
+                )
+
+            paths: list[list[int]] = []
+            if len(members) == 1 and not _out(members[0]):
+                paths.append([members[0]])
+            else:
+                for source in members:
+                    targets = _out(source)
+                    if not targets:
+                        continue
+                    if len(_in(source)) == 1 and len(targets) == 1:
+                        continue
+                    for target in targets:
+                        path = [source, target]
+                        current = target
+                        while True:
+                            nxt = _out(current)
+                            if len(_in(current)) != 1 or len(nxt) != 1:
+                                break
+                            current = nxt[0]
+                            path.append(current)
+                        paths.append(path)
+            paths.sort()
+            lineages.append(
+                [
+                    component_id,
+                    members,
+                    entries,
+                    exits,
+                    paths,
+                    changes_by_component.get(component_id, []),
+                ]
+            )
+
+        return {
+            "nodes": nodes,
+            "transitions": transitions,
+            "lineages": lineages,
+        }
+
+    return {
+        "budgets": flow["budgets"],
+        "z": flow["z"],
+        "axes": {
+            "budget": _lineage_axis(flow["axes"]["budget"]),
+            "z": _lineage_axis(flow["axes"]["z"]),
         },
     }
 
