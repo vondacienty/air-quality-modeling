@@ -71,6 +71,7 @@ __all__ = [
     "risk_interval",
     "risk_probability",
     "risk_share",
+    "robust_policy_report",
     "sensitivity",
 ]
 
@@ -8583,6 +8584,76 @@ def robust_policy_summary(
     ]
 
     return choice, p, ranks[best], metrics, intervals, o
+
+
+def robust_policy_report(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budget: float,
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    z: float = 1.96,
+) -> dict:
+    """JSON-compatible summary of the robust plan and policy pick.
+
+    Every parameter constraint and every ``TypeError``/``ValueError``
+    condition is inherited verbatim from :func:`robust_policy_summary`;
+    exceptions propagate unchanged. The function calls
+    :func:`robust_policy_summary` exactly once, takes
+    ``(choice, p, ranks, metrics, intervals, o)`` and returns a dict
+    whose keys in order are ``choice``, ``policy``, ``robustness``,
+    ``weights`` and ``warning``. ``choice`` is a list copy of the
+    winning choice and ``policy`` is ``p``. ``robustness`` is
+    ``[max(ranks), fsum(ranks), list(ranks)]``. ``weights`` follows the
+    ``weight_sets`` order; entry ``l`` is ``[S, D, G, C, a, s, M, R, L,
+    U]`` with the first six values taken from ``metrics[l]`` and the
+    last four from ``intervals[l]`` copied as 2-D lists. ``warning``
+    follows the ``[runs, levels, triggers, first, cumulative]`` order of
+    ``o`` with every inner container recursively converted to a list and
+    ``None`` preserved. No value is rounded.
+    """
+    choice, p, ranks, metrics, intervals, o = robust_policy_summary(
+        H, W, thresholds, quantiles, policies, options, budget, weight_sets, z
+    )
+
+    def _as_lists(value: object) -> object:
+        if isinstance(value, (list, tuple)):
+            return [_as_lists(item) for item in value]
+        return value
+
+    weights: list[list] = []
+    for l in range(len(metrics)):
+        excess, spread, triggers, total_cost, a, s = metrics[l]
+        M, R, L, U = intervals[l]
+        weights.append(
+            [
+                excess,
+                spread,
+                triggers,
+                total_cost,
+                a,
+                s,
+                [list(row) for row in M],
+                [list(row) for row in R],
+                [list(row) for row in L],
+                [list(row) for row in U],
+            ]
+        )
+
+    runs, levels, warning_triggers, first, cumulative = o
+    return {
+        "choice": list(choice),
+        "policy": p,
+        "robustness": [max(ranks), math.fsum(ranks), list(ranks)],
+        "weights": weights,
+        "warning": [
+            _as_lists(item)
+            for item in (runs, levels, warning_triggers, first, cumulative)
+        ],
+    }
 
 
 def receptor_level_quantile(
