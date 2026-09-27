@@ -74,6 +74,7 @@ __all__ = [
     "robust_policy_grid",
     "robust_policy_grid_regions",
     "robust_policy_grid_turns",
+    "robust_policy_joint",
     "robust_policy_lineage",
     "robust_policy_region_flow",
     "robust_policy_report",
@@ -9675,6 +9676,184 @@ def robust_policy_lineage(
             "budget": _lineage_axis(flow["axes"]["budget"]),
             "z": _lineage_axis(flow["axes"]["z"]),
         },
+    }
+
+
+def robust_policy_joint(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Per-region joint view of both lineage axes.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_lineage` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_lineage` is called exactly once to
+    obtain the lineage result ``L``.
+
+    ``regions`` lists, in ascending region id, one entry
+    ``[region, state, B, Z]`` per region id. ``state`` is a recursive
+    list copy of the state carried by the first node on the budget axis
+    whose region equals the id; ``B`` and ``Z`` are the ascending,
+    deduplicated ids of the lineages (on the budget and z axes
+    respectively) that contain a node with that region.
+
+    ``branches`` enumerates the branching events of both axes in axis
+    order (``budget`` then ``z``), then slice-pair order, then the
+    pair's event order; only events whose ``kind`` is ``split``,
+    ``merge`` or ``merge_split`` contribute. Each entry is
+    ``[axis, pair, kind, from, to, overlap]`` with ``pair`` the slice
+    pair index, ``from`` and ``to`` the lineage ids hit by the event's
+    nodes on the earlier and later slices, and ``overlap`` unchanged
+    from the lineage transition.
+
+    ``adjacency_changes`` is ordered by axis (``budget`` then ``z``),
+    then lineage id, then the change order of that lineage. Within one
+    change the added edges come before the removed edges; identical
+    records reached through several lineages are listed once. Each
+    entry is ``[axis, earlier, later, action, small_region,
+    large_region, rank_diff, level_diff]`` with ``action`` ``add`` or
+    ``remove``, the two regions taken from the edge, and the two diffs
+    computed element-wise from the larger region's representative
+    state minus the smaller region's: ``ranks`` (state component 2)
+    and ``levels`` (state component 3) respectively.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``regions``, ``branches`` and ``adjacency_changes``; the first two
+    are copies of the same-named entries of ``L``. All containers are
+    JSON-compatible, ``None`` is preserved and no value is rounded.
+    """
+    lineage = robust_policy_lineage(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    # Per axis: lineage membership of each region and node lookup;
+    # the representative state comes from the first budget-axis node
+    # of each region.
+    region_lineages: dict[str, dict[int, list[int]]] = {}
+    for axis_name in ("budget", "z"):
+        axis = lineage["axes"][axis_name]
+        nodes = axis["nodes"]
+        node_by_id = {node[0]: node for node in nodes}
+        membership: dict[int, list[int]] = {}
+        for lin in axis["lineages"]:
+            lineage_id, lin_nodes = lin[0], lin[1]
+            touched_regions = {
+                node_by_id[node_id][5] for node_id in lin_nodes
+            }
+            for region_id in touched_regions:
+                membership.setdefault(region_id, []).append(lineage_id)
+        region_lineages[axis_name] = membership
+
+    region_ids = sorted(
+        set(region_lineages["budget"]) | set(region_lineages["z"])
+    )
+
+    state_of_region: dict[int, object] = {}
+    for node in lineage["axes"]["budget"]["nodes"]:
+        region_id = node[5]
+        if region_id not in state_of_region:
+            state_of_region[region_id] = _copy(node[6])
+
+    regions: list[list] = []
+    for region_id in region_ids:
+        regions.append(
+            [
+                region_id,
+                state_of_region[region_id],
+                sorted(set(region_lineages["budget"].get(region_id, ()))),
+                sorted(set(region_lineages["z"].get(region_id, ()))),
+            ]
+        )
+
+    # Branching events: axis, pair, event order, keeping only the
+    # many-sided kinds.
+    branches: list[list] = []
+    branching_kinds = {"split", "merge", "merge_split"}
+    for axis_name in ("budget", "z"):
+        axis = lineage["axes"][axis_name]
+        lineage_of_node: dict[int, int] = {}
+        for lin in axis["lineages"]:
+            for node_id in lin[1]:
+                lineage_of_node[node_id] = lin[0]
+        for pair_index, pair_transitions in enumerate(axis["transitions"]):
+            for kind, from_nodes, to_nodes, overlap in pair_transitions:
+                if kind not in branching_kinds:
+                    continue
+                branches.append(
+                    [
+                        axis_name,
+                        pair_index,
+                        kind,
+                        sorted({lineage_of_node[n] for n in from_nodes}),
+                        sorted({lineage_of_node[n] for n in to_nodes}),
+                        list(overlap),
+                    ]
+                )
+
+    # Adjacency changes per axis: flatten each lineage's changes in
+    # lineage id order; added edges precede removed edges; dedup the
+    # resulting records.
+    adjacency_changes: list[list] = []
+    for axis_name in ("budget", "z"):
+        axis = lineage["axes"][axis_name]
+        records: list[tuple] = []
+        seen: set[tuple] = set()
+        for lin in axis["lineages"]:
+            for earlier, later, added, removed in lin[5]:
+                for edge in added:
+                    key = (earlier, later, "add", edge[0], edge[1])
+                    if key not in seen:
+                        seen.add(key)
+                        records.append(key)
+                for edge in removed:
+                    key = (earlier, later, "remove", edge[0], edge[1])
+                    if key not in seen:
+                        seen.add(key)
+                        records.append(key)
+        for earlier, later, action, small_region, large_region in records:
+            small_state = state_of_region[small_region]
+            large_state = state_of_region[large_region]
+            rank_diff = [
+                large - small
+                for small, large in zip(small_state[2], large_state[2])
+            ]
+            level_diff = [
+                large - small
+                for small, large in zip(small_state[3], large_state[3])
+            ]
+            adjacency_changes.append(
+                [
+                    axis_name,
+                    earlier,
+                    later,
+                    action,
+                    small_region,
+                    large_region,
+                    rank_diff,
+                    level_diff,
+                ]
+            )
+
+    return {
+        "budgets": list(lineage["budgets"]),
+        "z": list(lineage["z"]),
+        "regions": regions,
+        "branches": branches,
+        "adjacency_changes": adjacency_changes,
     }
 
 
