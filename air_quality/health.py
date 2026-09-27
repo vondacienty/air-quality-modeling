@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_grid",
+    "robust_policy_grid_regions",
     "robust_policy_grid_turns",
     "robust_policy_report",
     "robust_policy_sensitivity",
@@ -9005,6 +9006,139 @@ def robust_policy_grid_turns(
         "states": states,
         "z_changes": z_changes,
         "budget_changes": budget_changes,
+    }
+
+
+def robust_policy_grid_regions(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Orthogonally connected regions of equal states on the robust grid.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_grid_turns` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_grid_turns` is called exactly once
+    to obtain the grid ``G``.
+
+    A cell ``[b, r]`` is adjacent only to its up, down, left and right
+    neighbours, and two cells share a state when the corresponding
+    entries of ``G["states"]`` compare equal. Cells are scanned with
+    ``b`` outer and ``r`` inner, skipping cells already assigned; each
+    flood fill gathers every orthogonally reachable cell with the same
+    state into one region. Region ids increase from ``0`` in scan
+    order, and each region's members are sorted by ``(b, r)``. Each
+    region is a dict whose keys in order are ``id``, ``cells``,
+    ``budget_bounds``, ``z_bounds`` and ``state``: ``cells`` lists the
+    ``[b, r]`` members, ``budget_bounds`` is the two-element float list
+    of the budgets at the extreme member ``b`` indices, ``z_bounds`` is
+    the analogous list of ``z`` values for the extreme member ``r``
+    indices, and ``state`` is a recursive list copy of the region's
+    state.
+
+    Two distinct regions with any orthogonally adjacent members form an
+    edge ``[smaller id, larger id]``; edges are deduplicated and sorted
+    by the two ids.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``states``, ``regions`` and ``adjacency``: the first three are
+    recursive list copies of the same-named entries of ``G``,
+    ``regions`` is ordered by id and ``adjacency`` is the edge list.
+    All containers are JSON-compatible, ``None`` is preserved and no
+    value is rounded.
+    """
+    grid = robust_policy_grid_turns(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+    grid_states = grid["states"]
+    budget_values = grid["budgets"]
+    z_values = grid["z"]
+    n_budgets = len(budget_values)
+    n_zs = len(z_values)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    region_of: dict[tuple[int, int], int] = {}
+    regions: list[dict] = []
+    for b0 in range(n_budgets):
+        for r0 in range(n_zs):
+            if (b0, r0) in region_of:
+                continue
+            region_id = len(regions)
+            state = grid_states[b0][r0]
+            cells: list[list[int]] = []
+            pending = [(b0, r0)]
+            region_of[(b0, r0)] = region_id
+            while pending:
+                b, r = pending.pop()
+                cells.append([b, r])
+                for nb, nr in (
+                    (b - 1, r), (b + 1, r), (b, r - 1), (b, r + 1)
+                ):
+                    if not (0 <= nb < n_budgets and 0 <= nr < n_zs):
+                        continue
+                    if (nb, nr) in region_of:
+                        continue
+                    if grid_states[nb][nr] != state:
+                        continue
+                    region_of[(nb, nr)] = region_id
+                    pending.append((nb, nr))
+            cells.sort(key=lambda cell: (cell[0], cell[1]))
+            b_min = cells[0][0]
+            b_max = cells[-1][0]
+            r_min = min(cell[1] for cell in cells)
+            r_max = max(cell[1] for cell in cells)
+            regions.append(
+                {
+                    "id": region_id,
+                    "cells": cells,
+                    "budget_bounds": [
+                        float(budget_values[b_min]),
+                        float(budget_values[b_max]),
+                    ],
+                    "z_bounds": [
+                        float(z_values[r_min]),
+                        float(z_values[r_max]),
+                    ],
+                    "state": _copy(state),
+                }
+            )
+
+    edge_set: set[tuple[int, int]] = set()
+    for b in range(n_budgets):
+        for r in range(n_zs):
+            current = region_of[(b, r)]
+            if b + 1 < n_budgets:
+                other = region_of[(b + 1, r)]
+                if other != current:
+                    edge_set.add(
+                        (current, other) if current < other else (other, current)
+                    )
+            if r + 1 < n_zs:
+                other = region_of[(b, r + 1)]
+                if other != current:
+                    edge_set.add(
+                        (current, other) if current < other else (other, current)
+                    )
+    adjacency = [[small, large] for small, large in sorted(edge_set)]
+
+    return {
+        "budgets": _copy(budget_values),
+        "z": _copy(z_values),
+        "states": _copy(grid_states),
+        "regions": regions,
+        "adjacency": adjacency,
     }
 
 
