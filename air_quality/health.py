@@ -76,6 +76,7 @@ __all__ = [
     "robust_policy_action_confirm",
     "robust_policy_action_progress",
     "robust_policy_action_restore",
+    "robust_policy_action_resume",
     "robust_policy_action_waves",
     "robust_policy_actions",
     "robust_policy_change_summary",
@@ -10799,7 +10800,8 @@ def robust_policy_action_restore(
     container type raises ``TypeError`` and an empty container raises
     ``ValueError``. Every item must be a dict with exactly the keys
     ``budgets``, ``z``, ``capacity``, ``checkpoint``, ``confirmed``,
-    ``pending`` and ``hits``: ``budgets`` and ``z`` must be non-empty
+    ``pending`` and ``hits``; an item that is not a dict raises
+    ``TypeError``. ``budgets`` and ``z`` must be non-empty
     lists of non-bool finite numbers >= 0, ``capacity`` a non-bool int
     >= 1, and ``confirmed``, ``pending`` and ``hits`` lists. The
     ``checkpoint`` value must be a dict with exactly the keys
@@ -10902,10 +10904,14 @@ def robust_policy_action_restore(
 
     for index, item in enumerate(checkpoints):
         prefix = f"checkpoints[{index}]"
-        if not isinstance(item, dict) or set(item.keys()) != set(result_keys):
+        if not isinstance(item, dict):
+            raise TypeError(
+                f"{prefix} must be a dict, got {type(item).__name__}"
+            )
+        if set(item.keys()) != set(result_keys):
             raise ValueError(
                 f"{prefix} must be a dict with keys {list(result_keys)!r}, "
-                f"got {type(item).__name__}"
+                f"got keys {list(item)!r}"
             )
 
         budgets = item["budgets"]
@@ -11028,6 +11034,72 @@ def robust_policy_action_restore(
         "history": history,
         "pending": _copy(last_item["pending"]),
         "hits": _copy(last_item["hits"]),
+    }
+
+
+def robust_policy_action_resume(
+    checkpoints: list | tuple,
+    cursor: int = 0,
+    expected_done: int = 0,
+    limit: int | None = 1,
+) -> dict:
+    """Restore the confirmed state and plan the next pending actions.
+
+    The first three parameters share the contract of
+    :func:`robust_policy_action_restore` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). ``limit`` must be ``None`` or a non-bool int >= 1; a
+    wrong type raises ``TypeError`` and a value below 1 raises
+    ``ValueError``.
+
+    :func:`robust_policy_action_restore` is called exactly once to
+    obtain ``S``; ``P`` is ``S["pending"]``. When ``limit`` is ``None``
+    the plan takes all of ``P``, otherwise it takes ``P[:limit]``;
+    ``left`` holds the remaining items. Both keep the original order
+    and are recursively copied.
+
+    Returns a dict whose keys in order are ``state``, ``plan``,
+    ``pending``, ``hits`` and ``history``: the values are a recursive
+    copy of ``S["state"]``, the plan, ``left``, and recursive copies of
+    ``S["hits"]`` and ``S["history"]`` respectively. ``checkpoints`` is
+    never modified, no state is advanced when an exception is raised
+    and repeated calls with the same input return equal results. When
+    ``P`` is empty both ``plan`` and ``pending`` are empty and
+    ``state`` is unchanged. Every container is JSON-compatible,
+    ``None`` is preserved and no value is rounded.
+    """
+    if limit is not None:
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise TypeError(
+                "limit must be an int or None, got "
+                f"{type(limit).__name__}"
+            )
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+    restored = robust_policy_action_restore(checkpoints, cursor, expected_done)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    pending = restored["pending"]
+    if limit is None:
+        plan = _copy(pending)
+        left: list = []
+    else:
+        plan = _copy(pending[:limit])
+        left = _copy(pending[limit:])
+
+    return {
+        "state": _copy(restored["state"]),
+        "plan": plan,
+        "pending": left,
+        "hits": _copy(restored["hits"]),
+        "history": _copy(restored["history"]),
     }
 
 
