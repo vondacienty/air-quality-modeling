@@ -73,6 +73,7 @@ __all__ = [
     "risk_share",
     "robust_policy_action_batches",
     "robust_policy_action_checkpoint",
+    "robust_policy_action_commit",
     "robust_policy_action_confirm",
     "robust_policy_action_progress",
     "robust_policy_action_restore",
@@ -10807,7 +10808,10 @@ def robust_policy_action_restore(
     ``checkpoint`` value must be a dict with exactly the keys
     ``from_cursor``, ``to_cursor``, ``next_cursor``, ``old_done``,
     ``done``, ``delta`` and ``remaining`` whose seven values are
-    non-bool ints >= 0. Any missing or extra key or malformed value
+    non-bool ints >= 0, or a list of seven non-bool ints >= 0 in that
+    same key order (the form produced by
+    :func:`robust_policy_action_commit`); a list-form checkpoint is
+    kept as a list in ``history``. Any missing or extra key or malformed value
     raises ``ValueError``; the same is raised when the ``budgets``,
     ``z`` or ``capacity`` values are not identical across all items,
     when a value is negative, when ``next_cursor`` differs from
@@ -10917,7 +10921,7 @@ def robust_policy_action_restore(
         budgets = item["budgets"]
         zs = item["z"]
         capacity = item["capacity"]
-        checkpoint = item["checkpoint"]
+        raw_checkpoint = item["checkpoint"]
 
         if not _valid_number_list("budgets", budgets):
             raise ValueError(
@@ -10945,14 +10949,29 @@ def robust_policy_action_restore(
                     f"{type(item[list_name]).__name__}"
                 )
 
-        if (
-            not isinstance(checkpoint, dict)
-            or set(checkpoint.keys()) != set(checkpoint_keys)
+        if isinstance(raw_checkpoint, list):
+            if len(raw_checkpoint) != len(checkpoint_keys):
+                raise ValueError(
+                    f"{prefix}['checkpoint'] list must have "
+                    f"{len(checkpoint_keys)} entries in key order "
+                    f"{list(checkpoint_keys)!r}, got {raw_checkpoint!r}"
+                )
+            checkpoint = {
+                key: raw_checkpoint[index]
+                for index, key in enumerate(checkpoint_keys)
+            }
+        elif (
+            not isinstance(raw_checkpoint, dict)
+            or set(raw_checkpoint.keys()) != set(checkpoint_keys)
         ):
             raise ValueError(
                 f"{prefix}['checkpoint'] must be a dict with keys "
-                f"{list(checkpoint_keys)!r}, got {type(checkpoint).__name__}"
+                f"{list(checkpoint_keys)!r} or a list of "
+                f"{len(checkpoint_keys)} entries in that order, got "
+                f"{type(raw_checkpoint).__name__}"
             )
+        else:
+            checkpoint = raw_checkpoint
 
         numbers: dict[str, int] = {}
         for key in checkpoint_keys:
@@ -11019,17 +11038,16 @@ def robust_policy_action_restore(
                 f"{numbers['old_done']}, expected {prev_done}"
             )
 
-        history.append(_copy(checkpoint))
+        history.append(_copy(raw_checkpoint))
         prev_to_cursor = to_cursor
         prev_done = numbers["done"]
 
     last_item = checkpoints[-1]
-    last_checkpoint = last_item["checkpoint"]
     return {
         "state": [
-            last_checkpoint["next_cursor"],
-            last_checkpoint["done"],
-            last_checkpoint["remaining"],
+            checkpoint["next_cursor"],
+            checkpoint["done"],
+            checkpoint["remaining"],
         ],
         "history": history,
         "pending": _copy(last_item["pending"]),
@@ -11100,6 +11118,106 @@ def robust_policy_action_resume(
         "pending": left,
         "hits": _copy(restored["hits"]),
         "history": _copy(restored["history"]),
+    }
+
+
+def robust_policy_action_commit(
+    checkpoints: list | tuple,
+    completed: int,
+    failed: bool = False,
+    cursor: int = 0,
+    expected_done: int = 0,
+) -> dict:
+    """Commit planned actions and roll failed or unconfirmed ones back.
+
+    The first, fourth and fifth parameters share the contract of
+    :func:`robust_policy_action_resume` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). ``completed`` must be a non-bool int >= 0 and
+    ``failed`` must be a bool; a wrong type raises ``TypeError`` and a
+    negative ``completed`` raises ``ValueError``.
+
+    :func:`robust_policy_action_resume` is called exactly once with
+    ``limit = max(1, completed + int(failed))`` to obtain ``S``; its
+    ``plan`` is the planned wave entries. When the requested action
+    count ``completed + int(failed)`` exceeds the plan length a
+    ``ValueError`` is raised.
+
+    ``C`` recursively copies the first ``completed`` entries of the
+    plan with each entry's status (entry 0) replaced by ``"done"``.
+    ``P`` recursively copies ``plan[completed:] + S["pending"]``, so
+    the failed entry and every unconfirmed entry roll back to pending.
+    Let ``[c, d, r] = S["state"]`` be the restored cursor, done count
+    and remaining count. When ``C`` is empty ``nc``, ``nd`` and ``nr``
+    are ``c``, ``d`` and ``r``; otherwise ``nc`` is the last entry of
+    ``C[-1]``, ``nd`` is ``C[-1][2]`` and ``nr`` is ``r - nd + d``.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``capacity``, ``checkpoint``, ``confirmed``, ``pending`` and
+    ``hits``: the first three values copy the same-named values of the
+    last input checkpoint, ``confirmed`` and ``pending`` are ``C`` and
+    ``P``, ``hits`` recursively copies ``S["hits"]``, and
+    ``checkpoint`` is ``[c, nc, nc, d, nd, nd - d, nr]``, matching the
+    existing checkpoint key order. The result may be appended to the
+    checkpoints of a later :func:`robust_policy_action_restore` or
+    :func:`robust_policy_action_resume` call. Every list is
+    recursively copied, every container is JSON-compatible, ``None``
+    values are preserved and no value is rounded.
+    """
+    if not isinstance(completed, int) or isinstance(completed, bool):
+        raise TypeError(
+            f"completed must be an int, got {type(completed).__name__}"
+        )
+    if not isinstance(failed, bool):
+        raise TypeError(
+            f"failed must be a bool, got {type(failed).__name__}"
+        )
+    if completed < 0:
+        raise ValueError(f"completed must be >= 0, got {completed}")
+
+    requested = completed + int(failed)
+    resumed = robust_policy_action_resume(
+        checkpoints, cursor, expected_done, max(1, requested)
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    plan = resumed["plan"]
+    if requested > len(plan):
+        raise ValueError(
+            f"requested action count {requested} exceeds plan length "
+            f"{len(plan)}"
+        )
+
+    confirmed: list[list] = []
+    for entry in plan[:completed]:
+        done_entry = _copy(entry)
+        done_entry[0] = "done"
+        confirmed.append(done_entry)
+    pending = _copy(plan[completed:]) + _copy(resumed["pending"])
+
+    c, d, r = resumed["state"]
+    if not confirmed:
+        nc, nd, nr = c, d, r
+    else:
+        nc = confirmed[-1][-1]
+        nd = confirmed[-1][2]
+        nr = r - nd + d
+
+    last_item = checkpoints[-1]
+    return {
+        "budgets": _copy(last_item["budgets"]),
+        "z": _copy(last_item["z"]),
+        "capacity": last_item["capacity"],
+        "checkpoint": [c, nc, nc, d, nd, nd - d, nr],
+        "confirmed": confirmed,
+        "pending": pending,
+        "hits": _copy(resumed["hits"]),
     }
 
 
