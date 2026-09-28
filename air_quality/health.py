@@ -73,6 +73,7 @@ __all__ = [
     "risk_share",
     "robust_policy_action_batches",
     "robust_policy_action_progress",
+    "robust_policy_action_waves",
     "robust_policy_actions",
     "robust_policy_change_summary",
     "robust_policy_grid",
@@ -10363,9 +10364,10 @@ def robust_policy_action_progress(
     ``TypeError`` and ``ValueError`` is inherited verbatim; exceptions
     propagate unchanged). :func:`robust_policy_action_batches` is called
     exactly once to obtain ``A``. Each of ``rank_threshold`` and
-    ``level_threshold`` must be a non-bool finite int or float >= 0; a
-    wrong type raises ``TypeError`` and a non-finite or negative value
-    raises ``ValueError``.
+    ``level_threshold`` must be a non-bool int or float >= 0; ints are
+    never converted to float (arbitrarily large ints are accepted),
+    while floats must be finite. A wrong type raises ``TypeError`` and a
+    non-finite float or negative value raises ``ValueError``.
 
     Let ``Q`` be the total number of actions. For each batch of
     ``A["batches"]`` (in order), with ``e = batch["range"][1]`` and
@@ -10385,25 +10387,19 @@ def robust_policy_action_progress(
     Every container is JSON-compatible, ``None`` is preserved and no
     value is rounded.
     """
-    if not _is_number(rank_threshold):
-        raise TypeError(
-            "rank_threshold must be an int or float, got "
-            f"{type(rank_threshold).__name__}"
-        )
-    rank_limit = float(rank_threshold)
-    _check_finite("rank_threshold", rank_limit)
-    if rank_limit < 0:
-        raise ValueError(f"rank_threshold must be >= 0, got {rank_limit!r}")
+    def _threshold(name: str, value: object) -> int | float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(
+                f"{name} must be an int or float, got {type(value).__name__}"
+            )
+        if isinstance(value, float):
+            _check_finite(name, value)
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value!r}")
+        return value
 
-    if not _is_number(level_threshold):
-        raise TypeError(
-            "level_threshold must be an int or float, got "
-            f"{type(level_threshold).__name__}"
-        )
-    level_limit = float(level_threshold)
-    _check_finite("level_threshold", level_limit)
-    if level_limit < 0:
-        raise ValueError(f"level_threshold must be >= 0, got {level_limit!r}")
+    rank_limit = _threshold("rank_threshold", rank_threshold)
+    level_limit = _threshold("level_threshold", level_threshold)
 
     batched = robust_policy_action_batches(
         H, W, thresholds, quantiles, policies, options,
@@ -10470,6 +10466,112 @@ def robust_policy_action_progress(
             last_level,
             first_rank,
             first_level,
+        ],
+    }
+
+
+def robust_policy_action_waves(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+    capacity: int = 10,
+    rank_threshold: float = 0.0,
+    level_threshold: float = 0.0,
+    cursor: int = 0,
+) -> dict:
+    """Pending/done waves of the batched action queue at a cursor.
+
+    Every parameter except ``cursor`` shares the contract of
+    :func:`robust_policy_action_progress` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_action_progress` is called exactly
+    once to obtain ``P``; ``Q`` and ``B`` are the first two entries of
+    ``P["summary"]`` (the total number of actions and the number of
+    batches). ``cursor`` must be a non-bool int with
+    ``0 <= cursor <= Q``; a wrong type raises ``TypeError`` and an
+    out-of-range value raises ``ValueError``.
+
+    For each progress entry ``x`` (in order) the wave entry is
+    ``[status] + copy(x) + [x[0] + 1]`` where ``status`` is ``"done"``
+    when ``x[0] < cursor`` and ``"pending"`` otherwise. ``hits`` is
+    ordered by rank then level: for each of the rank flag (entry 4) and
+    the level flag (entry 5), take entries 0, 1, 7 and 8 of the first
+    progress entry ``x`` whose flag is true, or ``None`` when no flag is.
+    ``done`` is ``0`` when ``cursor`` is 0, otherwise ``x[1]`` of the
+    previous (done) batch.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``capacity``, ``cursor``, ``waves``, ``hits`` and ``summary``: the
+    first three values recursively copy the same-named values of ``P``,
+    and ``summary`` is ``[Q, B, done, Q - done]``. Every list is
+    recursively copied; all containers are JSON-compatible, ``None`` is
+    preserved and no value is rounded.
+    """
+    if not isinstance(cursor, int) or isinstance(cursor, bool):
+        raise TypeError(
+            f"cursor must be an int, got {type(cursor).__name__}"
+        )
+
+    progress_result = robust_policy_action_progress(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs, capacity,
+        rank_threshold, level_threshold,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    total_actions, num_batches = progress_result["summary"][:2]
+    if cursor < 0 or cursor > total_actions:
+        raise ValueError(
+            f"cursor must satisfy 0 <= cursor <= {total_actions}, got {cursor}"
+        )
+
+    progress_entries = progress_result["progress"]
+    waves: list[list] = []
+    done = 0
+    for x in progress_entries:
+        is_done = x[0] < cursor
+        if is_done:
+            done = x[1]
+        waves.append(
+            ["done" if is_done else "pending"]
+            + _copy(x)
+            + [x[0] + 1]
+        )
+
+    hits: list = [None, None]
+    for flag_index in (4, 5):
+        for x in progress_entries:
+            if x[flag_index]:
+                hits[flag_index - 4] = [
+                    x[0],
+                    x[1],
+                    _copy(x[7]),
+                    _copy(x[8]),
+                ]
+                break
+
+    return {
+        "budgets": _copy(progress_result["budgets"]),
+        "z": _copy(progress_result["z"]),
+        "capacity": progress_result["capacity"],
+        "cursor": cursor,
+        "waves": waves,
+        "hits": hits,
+        "summary": [
+            total_actions,
+            num_batches,
+            done,
+            total_actions - done,
         ],
     }
 
