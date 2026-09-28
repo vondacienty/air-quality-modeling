@@ -73,6 +73,7 @@ __all__ = [
     "risk_share",
     "robust_policy_action_batches",
     "robust_policy_action_progress",
+    "robust_policy_action_waves",
     "robust_policy_actions",
     "robust_policy_change_summary",
     "robust_policy_grid",
@@ -10342,6 +10343,23 @@ def robust_policy_action_batches(
     }
 
 
+def _validate_non_negative_threshold(name: str, value: object) -> object:
+    """Validate a non-bool finite int or float >= 0.
+
+    Ints (including ints too large to convert to float) are kept as
+    ints — they are intrinsically finite and never converted.
+    """
+    if not _is_number(value):
+        raise TypeError(
+            f"{name} must be an int or float, got {type(value).__name__}"
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value!r}")
+    return value
+
+
 def robust_policy_action_progress(
     H: list[list[float]] | tuple[tuple[float, ...], ...],
     W: list[list[float]] | tuple[tuple[float, ...], ...],
@@ -10363,9 +10381,10 @@ def robust_policy_action_progress(
     ``TypeError`` and ``ValueError`` is inherited verbatim; exceptions
     propagate unchanged). :func:`robust_policy_action_batches` is called
     exactly once to obtain ``A``. Each of ``rank_threshold`` and
-    ``level_threshold`` must be a non-bool finite int or float >= 0; a
-    wrong type raises ``TypeError`` and a non-finite or negative value
-    raises ``ValueError``.
+    ``level_threshold`` must be a non-bool int or finite float >= 0; a
+    wrong type raises ``TypeError`` and a non-finite float or negative
+    value raises ``ValueError``. Ints — however large — are accepted
+    without conversion to float.
 
     Let ``Q`` be the total number of actions. For each batch of
     ``A["batches"]`` (in order), with ``e = batch["range"][1]`` and
@@ -10385,25 +10404,12 @@ def robust_policy_action_progress(
     Every container is JSON-compatible, ``None`` is preserved and no
     value is rounded.
     """
-    if not _is_number(rank_threshold):
-        raise TypeError(
-            "rank_threshold must be an int or float, got "
-            f"{type(rank_threshold).__name__}"
-        )
-    rank_limit = float(rank_threshold)
-    _check_finite("rank_threshold", rank_limit)
-    if rank_limit < 0:
-        raise ValueError(f"rank_threshold must be >= 0, got {rank_limit!r}")
-
-    if not _is_number(level_threshold):
-        raise TypeError(
-            "level_threshold must be an int or float, got "
-            f"{type(level_threshold).__name__}"
-        )
-    level_limit = float(level_threshold)
-    _check_finite("level_threshold", level_limit)
-    if level_limit < 0:
-        raise ValueError(f"level_threshold must be >= 0, got {level_limit!r}")
+    rank_limit = _validate_non_negative_threshold(
+        "rank_threshold", rank_threshold
+    )
+    level_limit = _validate_non_negative_threshold(
+        "level_threshold", level_threshold
+    )
 
     batched = robust_policy_action_batches(
         H, W, thresholds, quantiles, policies, options,
@@ -10471,6 +10477,109 @@ def robust_policy_action_progress(
             first_rank,
             first_level,
         ],
+    }
+
+
+def robust_policy_action_waves(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+    capacity: int = 10,
+    rank_threshold: float = 0.0,
+    level_threshold: float = 0.0,
+    cursor: int = 0,
+) -> dict:
+    """Progress entries split into done/pending waves at a batch cursor.
+
+    Every parameter except ``cursor`` shares the contract of
+    :func:`robust_policy_action_progress` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_action_progress` is called exactly
+    once to obtain ``P``; ``Q`` and ``B`` are the first two entries of
+    ``P["summary"]`` (the total action count and the batch count).
+    ``cursor`` must be a non-bool int with ``0 <= cursor <= B``; a
+    wrong type raises ``TypeError`` and an out-of-range value raises
+    ``ValueError``.
+
+    For each progress entry ``x`` of ``P["progress"]`` (in order), the
+    wave entry is ``[status] + copy(x) + [x[0] + 1]``, where ``copy`` is
+    a recursive list copy and ``status`` is ``"done"`` when
+    ``x[0] < cursor`` and ``"pending"`` otherwise. ``hits`` is ordered
+    by the rank then the level flag: for each flag (entries 4 and 5 of
+    ``x``) it takes the first ``x`` in progress order whose flag is
+    true and stores recursive copies of entries ``x[0]``, ``x[1]``,
+    ``x[7]`` and ``x[8]``, or ``None`` when no flag is. ``done`` is 0
+    when ``cursor == 0``, otherwise ``x[1]`` of the previous batch
+    (``P["progress"][cursor - 1][1]``).
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``capacity``, ``cursor``, ``waves``, ``hits`` and ``summary``: the
+    first three values recursively copy the same-named values of ``P``,
+    and ``summary`` is ``[Q, B, done, Q - done]``. Every list is
+    recursively copied, every container is JSON-compatible and no value
+    is rounded.
+    """
+    if not isinstance(cursor, int) or isinstance(cursor, bool):
+        raise TypeError(
+            f"cursor must be an int, got {type(cursor).__name__}"
+        )
+
+    progress_result = robust_policy_action_progress(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs, capacity,
+        rank_threshold, level_threshold,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    entries = progress_result["progress"]
+    total_actions, batch_count = progress_result["summary"][0:2]
+    if cursor < 0 or cursor > batch_count:
+        raise ValueError(
+            f"cursor must satisfy 0 <= cursor <= {batch_count}, got {cursor}"
+        )
+
+    waves: list[list] = []
+    for entry in entries:
+        status = "done" if entry[0] < cursor else "pending"
+        waves.append([status, *_copy(entry), entry[0] + 1])
+
+    hits: list[list | None] = []
+    for flag_index in (4, 5):
+        hit: list | None = None
+        for entry in entries:
+            if entry[flag_index]:
+                hit = [
+                    _copy(entry[0]),
+                    _copy(entry[1]),
+                    _copy(entry[7]),
+                    _copy(entry[8]),
+                ]
+                break
+        hits.append(hit)
+
+    if cursor == 0:
+        done = 0
+    else:
+        done = entries[cursor - 1][1]
+
+    return {
+        "budgets": _copy(progress_result["budgets"]),
+        "z": _copy(progress_result["z"]),
+        "capacity": progress_result["capacity"],
+        "cursor": cursor,
+        "waves": waves,
+        "hits": hits,
+        "summary": [total_actions, batch_count, done, total_actions - done],
     }
 
 
