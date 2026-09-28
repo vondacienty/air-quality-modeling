@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_action_batches",
+    "robust_policy_action_confirm",
     "robust_policy_action_progress",
     "robust_policy_action_waves",
     "robust_policy_actions",
@@ -10580,6 +10581,109 @@ def robust_policy_action_waves(
         "waves": waves,
         "hits": hits,
         "summary": [total_actions, batch_count, done, total_actions - done],
+    }
+
+
+def robust_policy_action_confirm(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[tuple[float, ...], ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+    capacity: int = 10,
+    rank_threshold: float = 0.0,
+    level_threshold: float = 0.0,
+    cursor: int = 0,
+    *,
+    target_cursor: int,
+) -> dict:
+    """Confirm the waves between a base cursor and a target cursor.
+
+    Every parameter except ``target_cursor`` shares the contract of
+    :func:`robust_policy_action_waves` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). ``target_cursor`` is keyword-only and must be a
+    non-bool int; a wrong type raises ``TypeError``.
+    :func:`robust_policy_action_waves` is called exactly once with
+    ``target_cursor`` in place of ``cursor`` to obtain ``W``; ``V`` is
+    ``W["waves"]`` and ``Q`` and ``B`` are the first two entries of
+    ``W["summary"]`` (the total action count and the batch count). The
+    cursors must satisfy ``0 <= cursor <= target_cursor <= B``;
+    otherwise ``ValueError`` is raised (``cursor`` keeps the non-bool
+    int type rule of :func:`robust_policy_action_waves`).
+
+    ``old`` is ``0`` when ``cursor == 0``, otherwise
+    ``V[cursor - 1][2]``; ``new`` is ``W["summary"][2]``.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``capacity``, ``from_cursor``, ``to_cursor``, ``confirmed``,
+    ``pending``, ``hits`` and ``summary``: the first three values copy
+    the same-named values of ``W``, ``from_cursor`` and ``to_cursor``
+    are ``cursor`` and ``target_cursor`` unchanged, ``confirmed`` and
+    ``pending`` are recursive copies of ``V[cursor:target_cursor]``
+    and ``V[target_cursor:]`` respectively, ``hits`` copies the
+    same-named value of ``W``, and ``summary`` is
+    ``[Q, B, old, new, new - old, Q - new, target_cursor]``. Every
+    list is recursively copied, every container is JSON-compatible,
+    ``None`` is preserved and no value is rounded.
+    """
+    if not isinstance(cursor, int) or isinstance(cursor, bool):
+        raise TypeError(
+            f"cursor must be an int, got {type(cursor).__name__}"
+        )
+    if not isinstance(target_cursor, int) or isinstance(target_cursor, bool):
+        raise TypeError(
+            f"target_cursor must be an int, got {type(target_cursor).__name__}"
+        )
+
+    waves_result = robust_policy_action_waves(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs, capacity,
+        rank_threshold, level_threshold, target_cursor,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    entries = waves_result["waves"]
+    total_actions, batch_count = waves_result["summary"][0:2]
+    if cursor < 0 or cursor > target_cursor:
+        raise ValueError(
+            f"cursors must satisfy 0 <= cursor <= target_cursor "
+            f"<= {batch_count}, got cursor={cursor}, "
+            f"target_cursor={target_cursor}"
+        )
+
+    if cursor == 0:
+        old = 0
+    else:
+        old = entries[cursor - 1][2]
+    new = waves_result["summary"][2]
+
+    return {
+        "budgets": _copy(waves_result["budgets"]),
+        "z": _copy(waves_result["z"]),
+        "capacity": waves_result["capacity"],
+        "from_cursor": cursor,
+        "to_cursor": target_cursor,
+        "confirmed": _copy(entries[cursor:target_cursor]),
+        "pending": _copy(entries[target_cursor:]),
+        "hits": _copy(waves_result["hits"]),
+        "summary": [
+            total_actions,
+            batch_count,
+            old,
+            new,
+            new - old,
+            total_actions - new,
+            target_cursor,
+        ],
     }
 
 
