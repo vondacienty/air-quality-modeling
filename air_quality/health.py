@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_action_batches",
+    "robust_policy_action_checkpoint",
     "robust_policy_action_confirm",
     "robust_policy_action_progress",
     "robust_policy_action_waves",
@@ -10687,6 +10688,101 @@ def robust_policy_action_confirm(
             total_actions - new,
             target_cursor,
         ],
+    }
+
+
+def robust_policy_action_checkpoint(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+    capacity: int = 10,
+    rank_threshold: float = 0.0,
+    level_threshold: float = 0.0,
+    cursor: int = 0,
+    *,
+    target_cursor: int,
+    expected_done: int,
+) -> dict:
+    """Confirm waves and guard the previously-completed action count.
+
+    The signature is :func:`robust_policy_action_confirm` with a
+    required keyword-only ``expected_done`` appended after
+    ``target_cursor``. Every parameter other than ``expected_done``
+    shares the contract of :func:`robust_policy_action_confirm`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim;
+    exceptions propagate unchanged). ``expected_done`` must be a
+    non-bool int >= 0 or a ``TypeError`` (wrong type) or
+    ``ValueError`` (negative) is raised.
+
+    :func:`robust_policy_action_confirm` is called exactly once to
+    obtain ``C``; ``old``, ``new``, ``delta`` and ``remaining`` are
+    entries 2 through 5 (0-based) of ``C["summary"]``, i.e.
+    ``C["summary"][2:6]``. If ``expected_done`` differs from ``old`` a
+    ``RuntimeError`` is raised.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``capacity``, ``checkpoint``, ``confirmed``, ``pending`` and
+    ``hits``: six values recursively copy the same-named values of
+    ``C``, and ``checkpoint`` is a dict whose keys in order are
+    ``from_cursor``, ``to_cursor``, ``next_cursor``, ``old_done``,
+    ``done``, ``delta`` and ``remaining``, with values
+    ``C["from_cursor"]``, ``C["to_cursor"]``, ``C["to_cursor"]``,
+    ``old``, ``new``, ``delta`` and ``remaining`` respectively.
+    ``target_cursor == cursor`` is legal: ``confirmed`` is empty and
+    ``delta`` is 0. Every container is JSON-compatible, ``None``
+    values are preserved and no value is rounded.
+    """
+    if not isinstance(expected_done, int) or isinstance(expected_done, bool):
+        raise TypeError(
+            "expected_done must be an int, got "
+            f"{type(expected_done).__name__}"
+        )
+    if expected_done < 0:
+        raise ValueError(
+            f"expected_done must be >= 0, got {expected_done}"
+        )
+
+    confirm_result = robust_policy_action_confirm(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs, capacity,
+        rank_threshold, level_threshold, cursor,
+        target_cursor=target_cursor,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    old, new, delta, remaining = confirm_result["summary"][2:6]
+    if expected_done != old:
+        raise RuntimeError(
+            "expected_done does not match the completed action count: "
+            f"expected {expected_done}, got {old}"
+        )
+
+    return {
+        "budgets": _copy(confirm_result["budgets"]),
+        "z": _copy(confirm_result["z"]),
+        "capacity": confirm_result["capacity"],
+        "checkpoint": {
+            "from_cursor": confirm_result["from_cursor"],
+            "to_cursor": confirm_result["to_cursor"],
+            "next_cursor": confirm_result["to_cursor"],
+            "old_done": old,
+            "done": new,
+            "delta": delta,
+            "remaining": remaining,
+        },
+        "confirmed": _copy(confirm_result["confirmed"]),
+        "pending": _copy(confirm_result["pending"]),
+        "hits": _copy(confirm_result["hits"]),
     }
 
 
