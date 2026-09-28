@@ -71,6 +71,7 @@ __all__ = [
     "risk_interval",
     "risk_probability",
     "risk_share",
+    "robust_policy_change_summary",
     "robust_policy_grid",
     "robust_policy_grid_regions",
     "robust_policy_grid_turns",
@@ -9879,6 +9880,153 @@ def robust_policy_joint(
         "regions": regions,
         "branches": branches,
         "adjacency_changes": adjacency_changes,
+    }
+
+
+def robust_policy_change_summary(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Branch events and rank/level changes summarized per region.
+
+    Every parameter shares the contract of :func:`robust_policy_joint`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim;
+    exceptions propagate unchanged). :func:`robust_policy_joint` is
+    called once for the joint result ``J`` and
+    :func:`robust_policy_lineage` once for the lineage result ``L``.
+
+    Each co-axis node of ``L`` maps its node id to the node's region;
+    the regions touched by a branch are the union of the mapped values
+    of its ``from`` and ``to`` nodes. Split, merge and merge_split
+    branch events are deduplicated per region (a multi-region event
+    counts once for every region it touches).
+
+    ``regions`` lists, in ascending region order, one
+    ``[region, B, RI, LI]`` entry per region. ``B`` stores, in budget
+    then z axis order and split, merge, merge_split event-kind order,
+    the six event counts touching the region. ``RI`` is the
+    ``math.fsum`` of the absolute values of the rank-diff elements of
+    the region's endpoint adjacency changes, and ``LI`` is the same
+    accumulation over the level-diff elements.
+
+    For every unordered region pair present on both axes' adjacency
+    changes, ``[action, rank_diff_copy, level_diff_copy]`` entries are
+    collected in the original order of ``J``'s adjacency changes
+    separately for the budget and z axes. Each pair appears once, as
+    ``[small_region, large_region, budget_list, z_list]``: pairs whose
+    two collected lists are equal go to ``consistent``, the others to
+    ``conflicts``, pairs in ascending order.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``regions``, ``consistent`` and ``conflicts``: the first two are
+    copies of the same-named entries of ``J``. All containers are
+    JSON-compatible and no value is rounded.
+    """
+    joint = robust_policy_joint(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+    lineage = robust_policy_lineage(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    axis_names = ("budget", "z")
+    kind_index = {"split": 0, "merge": 1, "merge_split": 2}
+
+    # Co-axis node id -> region for attributing branch events.
+    region_of_node: dict[str, dict[int, int]] = {}
+    touched_regions: set[int] = set()
+    for axis_name in axis_names:
+        node_regions = {
+            node[0]: node[5] for node in lineage["axes"][axis_name]["nodes"]
+        }
+        region_of_node[axis_name] = node_regions
+        touched_regions.update(node_regions.values())
+
+    event_sets: dict[int, list[set]] = {
+        region_id: [set() for _ in range(6)] for region_id in touched_regions
+    }
+    for event_index, branch in enumerate(joint["branches"]):
+        axis_name, _pair, kind, from_nodes, to_nodes, _overlap = branch
+        regions = {
+            region_of_node[axis_name][node_id]
+            for node_id in list(from_nodes) + list(to_nodes)
+        }
+        axis_pos = 0 if axis_name == "budget" else 1
+        kind_pos = kind_index[kind]
+        for region_id in regions:
+            event_sets[region_id][axis_pos * 3 + kind_pos].add(event_index)
+
+    rank_terms: dict[int, list[float]] = {}
+    level_terms: dict[int, list[float]] = {}
+
+    # Per axis, per unordered region pair: collected entries in the
+    # original order of J's adjacency changes.
+    entries_of: dict[str, dict[tuple[int, int], list]] = {
+        axis_name: {} for axis_name in axis_names
+    }
+    for change in joint["adjacency_changes"]:
+        (
+            axis_name,
+            _earlier,
+            _later,
+            action,
+            small,
+            large,
+            rank_diff,
+            level_diff,
+        ) = change
+        for endpoint in (small, large):
+            rank_terms.setdefault(endpoint, []).extend(
+                abs(value) for value in rank_diff
+            )
+            level_terms.setdefault(endpoint, []).extend(
+                abs(value) for value in level_diff
+            )
+        entries_of[axis_name].setdefault((small, large), []).append(
+            [action, list(rank_diff), list(level_diff)]
+        )
+
+    region_rows: list[list] = []
+    for region_id in sorted(touched_regions):
+        counts = [len(events) for events in event_sets[region_id]]
+        region_rows.append(
+            [
+                region_id,
+                counts,
+                math.fsum(rank_terms.get(region_id, ())),
+                math.fsum(level_terms.get(region_id, ())),
+            ]
+        )
+
+    consistent: list[list] = []
+    conflicts: list[list] = []
+    budget_entries = entries_of["budget"]
+    z_entries = entries_of["z"]
+    for pair in sorted(set(budget_entries) & set(z_entries)):
+        small, large = pair
+        budget_list = budget_entries[pair]
+        z_list = z_entries[pair]
+        item = [small, large, budget_list, z_list]
+        if budget_list == z_list:
+            consistent.append(item)
+        else:
+            conflicts.append(item)
+
+    return {
+        "budgets": list(joint["budgets"]),
+        "z": list(joint["z"]),
+        "regions": region_rows,
+        "consistent": consistent,
+        "conflicts": conflicts,
     }
 
 
