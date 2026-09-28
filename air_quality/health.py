@@ -75,6 +75,7 @@ __all__ = [
     "robust_policy_action_checkpoint",
     "robust_policy_action_confirm",
     "robust_policy_action_progress",
+    "robust_policy_action_restore",
     "robust_policy_action_waves",
     "robust_policy_actions",
     "robust_policy_change_summary",
@@ -10783,6 +10784,213 @@ def robust_policy_action_checkpoint(
         "confirmed": _copy(confirm_result["confirmed"]),
         "pending": _copy(confirm_result["pending"]),
         "hits": _copy(confirm_result["hits"]),
+    }
+
+
+def robust_policy_action_restore(
+    checkpoints: list | tuple,
+    cursor: int = 0,
+    expected_done: int = 0,
+) -> dict:
+    """Restore an action-queue state from a chain of checkpoints.
+
+    ``checkpoints`` must be a non-empty list or tuple whose items are
+    results of :func:`robust_policy_action_checkpoint` that share the
+    same ``budgets``, ``z`` and ``capacity`` values. ``cursor`` and
+    ``expected_done`` must be non-bool ints >= 0. A wrong container or
+    item type raises ``TypeError``; an empty ``checkpoints``, a missing
+    or malformed key, a negative value, ``next_cursor != to_cursor``,
+    ``delta != done - old_done``, ``remaining < 0`` or a cursor moving
+    backwards raises ``ValueError``. If the first item's
+    ``from_cursor``/``old_done`` differ from ``cursor``/``expected_done``,
+    or a later item's ``from_cursor``/``old_done`` differ from the
+    previous item's ``to_cursor``/``done``, a ``RuntimeError`` is
+    raised. Re-restoring with a zero delta at the same cursor is legal,
+    and an empty queue allows a 0 -> 0 record.
+
+    Returns a dict whose keys in order are ``state``, ``history``,
+    ``pending`` and ``hits``: ``state`` is ``[next_cursor, done,
+    remaining]`` of the last item, ``history`` holds a recursive copy
+    of each item's ``checkpoint``, and ``pending`` and ``hits``
+    recursively copy the same-named values of the last item. Every
+    container is JSON-compatible, ``None`` values are preserved and no
+    value is rounded.
+    """
+    if not isinstance(checkpoints, (list, tuple)):
+        raise TypeError(
+            "checkpoints must be a list or tuple, got "
+            f"{type(checkpoints).__name__}"
+        )
+    if not isinstance(cursor, int) or isinstance(cursor, bool):
+        raise TypeError(
+            f"cursor must be an int, got {type(cursor).__name__}"
+        )
+    if cursor < 0:
+        raise ValueError(f"cursor must be >= 0, got {cursor}")
+    if not isinstance(expected_done, int) or isinstance(expected_done, bool):
+        raise TypeError(
+            "expected_done must be an int, got "
+            f"{type(expected_done).__name__}"
+        )
+    if expected_done < 0:
+        raise ValueError(
+            f"expected_done must be >= 0, got {expected_done}"
+        )
+    if len(checkpoints) == 0:
+        raise ValueError("checkpoints must not be empty")
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _copy(item) for key, item in value.items()}
+        return value
+
+    def _check_int(name: str, value: object) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(
+                f"{name} must be an int, got {type(value).__name__}"
+            )
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+        return value
+
+    item_keys = (
+        "budgets", "z", "capacity", "checkpoint",
+        "confirmed", "pending", "hits",
+    )
+    checkpoint_keys = (
+        "from_cursor", "to_cursor", "next_cursor", "old_done",
+        "done", "delta", "remaining",
+    )
+
+    prev_to_cursor = cursor
+    prev_done = expected_done
+    last_item: dict | None = None
+    history: list = []
+    ref_budgets: object = None
+    ref_z: object = None
+    ref_capacity: object = None
+    for index, item in enumerate(checkpoints):
+        if not isinstance(item, dict):
+            raise TypeError(
+                f"checkpoints[{index}] must be a dict, got "
+                f"{type(item).__name__}"
+            )
+        for key in item_keys:
+            if key not in item:
+                raise ValueError(
+                    f"checkpoints[{index}] is missing key {key!r}"
+                )
+        checkpoint = item["checkpoint"]
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                f"checkpoints[{index}]['checkpoint'] must be a dict, got "
+                f"{type(checkpoint).__name__}"
+            )
+        for key in checkpoint_keys:
+            if key not in checkpoint:
+                raise ValueError(
+                    f"checkpoints[{index}]['checkpoint'] is missing key "
+                    f"{key!r}"
+                )
+
+        from_cursor = _check_int(
+            f"checkpoints[{index}]['checkpoint']['from_cursor']",
+            checkpoint["from_cursor"],
+        )
+        to_cursor = _check_int(
+            f"checkpoints[{index}]['checkpoint']['to_cursor']",
+            checkpoint["to_cursor"],
+        )
+        next_cursor = _check_int(
+            f"checkpoints[{index}]['checkpoint']['next_cursor']",
+            checkpoint["next_cursor"],
+        )
+        old_done = _check_int(
+            f"checkpoints[{index}]['checkpoint']['old_done']",
+            checkpoint["old_done"],
+        )
+        done = _check_int(
+            f"checkpoints[{index}]['checkpoint']['done']",
+            checkpoint["done"],
+        )
+        delta = _check_int(
+            f"checkpoints[{index}]['checkpoint']['delta']",
+            checkpoint["delta"],
+        )
+        remaining = _check_int(
+            f"checkpoints[{index}]['checkpoint']['remaining']",
+            checkpoint["remaining"],
+        )
+
+        if next_cursor != to_cursor:
+            raise ValueError(
+                f"checkpoints[{index}]['checkpoint']['next_cursor'] must "
+                f"equal 'to_cursor', got {next_cursor} != {to_cursor}"
+            )
+        if delta != done - old_done:
+            raise ValueError(
+                f"checkpoints[{index}]['checkpoint']['delta'] must equal "
+                f"done - old_done, got {delta} != {done - old_done}"
+            )
+        if to_cursor < from_cursor:
+            raise ValueError(
+                f"checkpoints[{index}]['checkpoint'] moves the cursor "
+                f"backwards: from_cursor={from_cursor}, "
+                f"to_cursor={to_cursor}"
+            )
+
+        if index == 0:
+            ref_budgets = item["budgets"]
+            ref_z = item["z"]
+            ref_capacity = item["capacity"]
+        else:
+            if item["budgets"] != ref_budgets:
+                raise ValueError(
+                    f"checkpoints[{index}]['budgets'] differs from "
+                    "checkpoints[0]['budgets']"
+                )
+            if item["z"] != ref_z:
+                raise ValueError(
+                    f"checkpoints[{index}]['z'] differs from "
+                    "checkpoints[0]['z']"
+                )
+            if item["capacity"] != ref_capacity:
+                raise ValueError(
+                    f"checkpoints[{index}]['capacity'] differs from "
+                    "checkpoints[0]['capacity']"
+                )
+
+        if from_cursor != prev_to_cursor or old_done != prev_done:
+            if index == 0:
+                raise RuntimeError(
+                    "first checkpoint does not continue from the given "
+                    f"state: from_cursor={from_cursor} and "
+                    f"old_done={old_done}, expected cursor={cursor} and "
+                    f"expected_done={expected_done}"
+                )
+            raise RuntimeError(
+                f"checkpoints[{index}] does not continue from "
+                f"checkpoints[{index - 1}]: from_cursor={from_cursor} and "
+                f"old_done={old_done}, expected to_cursor="
+                f"{prev_to_cursor} and done={prev_done}"
+            )
+
+        prev_to_cursor = to_cursor
+        prev_done = done
+        last_item = item
+        history.append(_copy(checkpoint))
+
+    return {
+        "state": [
+            last_item["checkpoint"]["next_cursor"],
+            last_item["checkpoint"]["done"],
+            last_item["checkpoint"]["remaining"],
+        ],
+        "history": history,
+        "pending": _copy(last_item["pending"]),
+        "hits": _copy(last_item["hits"]),
     }
 
 
