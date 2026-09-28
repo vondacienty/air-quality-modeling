@@ -75,6 +75,7 @@ __all__ = [
     "robust_policy_action_checkpoint",
     "robust_policy_action_confirm",
     "robust_policy_action_progress",
+    "robust_policy_action_restore",
     "robust_policy_action_waves",
     "robust_policy_actions",
     "robust_policy_change_summary",
@@ -10783,6 +10784,250 @@ def robust_policy_action_checkpoint(
         "confirmed": _copy(confirm_result["confirmed"]),
         "pending": _copy(confirm_result["pending"]),
         "hits": _copy(confirm_result["hits"]),
+    }
+
+
+def robust_policy_action_restore(
+    checkpoints: list | tuple,
+    cursor: int = 0,
+    expected_done: int = 0,
+) -> dict:
+    """Replay action-queue checkpoints to restore the confirmed state.
+
+    ``checkpoints`` must be a non-empty list or tuple whose items are
+    results of :func:`robust_policy_action_checkpoint`; a wrong
+    container type raises ``TypeError`` and an empty container raises
+    ``ValueError``. Every item must be a dict with exactly the keys
+    ``budgets``, ``z``, ``capacity``, ``checkpoint``, ``confirmed``,
+    ``pending`` and ``hits``: ``budgets`` and ``z`` must be non-empty
+    lists of non-bool finite numbers >= 0, ``capacity`` a non-bool int
+    >= 1, and ``confirmed``, ``pending`` and ``hits`` lists. The
+    ``checkpoint`` value must be a dict with exactly the keys
+    ``from_cursor``, ``to_cursor``, ``next_cursor``, ``old_done``,
+    ``done``, ``delta`` and ``remaining`` whose seven values are
+    non-bool ints >= 0. Any missing or extra key or malformed value
+    raises ``ValueError``; the same is raised when the ``budgets``,
+    ``z`` or ``capacity`` values are not identical across all items,
+    when a value is negative, when ``next_cursor`` differs from
+    ``to_cursor``, when ``delta`` differs from ``done - old_done``,
+    when ``remaining`` is negative or when ``to_cursor`` is below
+    ``from_cursor`` (a cursor moving backwards).
+
+    ``cursor`` and ``expected_done`` must be non-bool ints >= 0; a
+    wrong type raises ``TypeError`` and a negative value raises
+    ``ValueError``. The first checkpoint must have ``from_cursor``
+    equal to ``cursor`` and ``old_done`` equal to ``expected_done``;
+    every later checkpoint must have ``from_cursor`` equal to the
+    previous checkpoint's ``to_cursor`` and ``old_done`` equal to the
+    previous ``done``. Any mismatch raises ``RuntimeError``. A
+    zero-delta checkpoint at the same cursor may be replayed more than
+    once, and an empty queue may carry a 0 -> 0 record.
+
+    Returns a dict whose keys in order are ``state``, ``history``,
+    ``pending`` and ``hits``: ``state`` is
+    ``[next_cursor, done, remaining]`` of the last checkpoint,
+    ``history`` recursively copies every checkpoint dict in order, and
+    ``pending`` and ``hits`` recursively copy the last item's
+    same-named values. Every container is JSON-compatible, ``None`` is
+    preserved and no value is rounded.
+    """
+    if not isinstance(cursor, int) or isinstance(cursor, bool):
+        raise TypeError(
+            f"cursor must be an int, got {type(cursor).__name__}"
+        )
+    if not isinstance(expected_done, int) or isinstance(expected_done, bool):
+        raise TypeError(
+            "expected_done must be an int, got "
+            f"{type(expected_done).__name__}"
+        )
+    if cursor < 0:
+        raise ValueError(f"cursor must be >= 0, got {cursor}")
+    if expected_done < 0:
+        raise ValueError(
+            f"expected_done must be >= 0, got {expected_done}"
+        )
+
+    if not isinstance(checkpoints, (list, tuple)):
+        raise TypeError(
+            "checkpoints must be a list or tuple, got "
+            f"{type(checkpoints).__name__}"
+        )
+    if len(checkpoints) == 0:
+        raise ValueError("checkpoints must not be empty")
+
+    result_keys = (
+        "budgets",
+        "z",
+        "capacity",
+        "checkpoint",
+        "confirmed",
+        "pending",
+        "hits",
+    )
+    checkpoint_keys = (
+        "from_cursor",
+        "to_cursor",
+        "next_cursor",
+        "old_done",
+        "done",
+        "delta",
+        "remaining",
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    def _valid_number_list(name: str, value: object) -> bool:
+        if not isinstance(value, list) or len(value) == 0:
+            return False
+        for element in value:
+            if not _is_number(element):
+                return False
+            if isinstance(element, float) and not math.isfinite(element):
+                return False
+            if element < 0:
+                return False
+        return True
+
+    history: list[dict] = []
+    ref_budgets: object = None
+    ref_z: object = None
+    ref_capacity: object = None
+    prev_to_cursor = cursor
+    prev_done = expected_done
+
+    for index, item in enumerate(checkpoints):
+        prefix = f"checkpoints[{index}]"
+        if not isinstance(item, dict) or set(item.keys()) != set(result_keys):
+            raise ValueError(
+                f"{prefix} must be a dict with keys {list(result_keys)!r}, "
+                f"got {type(item).__name__}"
+            )
+
+        budgets = item["budgets"]
+        zs = item["z"]
+        capacity = item["capacity"]
+        checkpoint = item["checkpoint"]
+
+        if not _valid_number_list("budgets", budgets):
+            raise ValueError(
+                f"{prefix}['budgets'] must be a non-empty list of finite "
+                f"numbers >= 0, got {budgets!r}"
+            )
+        if not _valid_number_list("z", zs):
+            raise ValueError(
+                f"{prefix}['z'] must be a non-empty list of finite numbers "
+                f">= 0, got {zs!r}"
+            )
+        if not isinstance(capacity, int) or isinstance(capacity, bool):
+            raise ValueError(
+                f"{prefix}['capacity'] must be an int, got "
+                f"{type(capacity).__name__}"
+            )
+        if capacity < 1:
+            raise ValueError(
+                f"{prefix}['capacity'] must be >= 1, got {capacity}"
+            )
+        for list_name in ("confirmed", "pending", "hits"):
+            if not isinstance(item[list_name], list):
+                raise ValueError(
+                    f"{prefix}[{list_name!r}] must be a list, got "
+                    f"{type(item[list_name]).__name__}"
+                )
+
+        if (
+            not isinstance(checkpoint, dict)
+            or set(checkpoint.keys()) != set(checkpoint_keys)
+        ):
+            raise ValueError(
+                f"{prefix}['checkpoint'] must be a dict with keys "
+                f"{list(checkpoint_keys)!r}, got {type(checkpoint).__name__}"
+            )
+
+        numbers: dict[str, int] = {}
+        for key in checkpoint_keys:
+            value = checkpoint[key]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(
+                    f"{prefix}['checkpoint'][{key!r}] must be an int, got "
+                    f"{type(value).__name__}"
+                )
+            if value < 0:
+                raise ValueError(
+                    f"{prefix}['checkpoint'][{key!r}] must be >= 0, got "
+                    f"{value}"
+                )
+            numbers[key] = value
+
+        from_cursor = numbers["from_cursor"]
+        to_cursor = numbers["to_cursor"]
+        if numbers["next_cursor"] != to_cursor:
+            raise ValueError(
+                f"{prefix}['checkpoint']['next_cursor'] must equal "
+                f"'to_cursor' ({to_cursor}), got {numbers['next_cursor']}"
+            )
+        if numbers["delta"] != numbers["done"] - numbers["old_done"]:
+            raise ValueError(
+                f"{prefix}['checkpoint']['delta'] must equal done - "
+                f"old_done ({numbers['done'] - numbers['old_done']}), got "
+                f"{numbers['delta']}"
+            )
+        if to_cursor < from_cursor:
+            raise ValueError(
+                f"{prefix}['checkpoint'] cursor must not move backwards: "
+                f"from_cursor={from_cursor}, to_cursor={to_cursor}"
+            )
+
+        if index == 0:
+            ref_budgets = budgets
+            ref_z = zs
+            ref_capacity = capacity
+        elif budgets != ref_budgets:
+            raise ValueError(
+                f"{prefix}['budgets'] {budgets!r} does not match the first "
+                f"checkpoint's budgets {ref_budgets!r}"
+            )
+        elif zs != ref_z:
+            raise ValueError(
+                f"{prefix}['z'] {zs!r} does not match the first "
+                f"checkpoint's z {ref_z!r}"
+            )
+        elif capacity != ref_capacity:
+            raise ValueError(
+                f"{prefix}['capacity'] {capacity!r} does not match the "
+                f"first checkpoint's capacity {ref_capacity!r}"
+            )
+
+        if from_cursor != prev_to_cursor:
+            raise RuntimeError(
+                f"{prefix}['checkpoint']['from_cursor'] is {from_cursor}, "
+                f"expected {prev_to_cursor}"
+            )
+        if numbers["old_done"] != prev_done:
+            raise RuntimeError(
+                f"{prefix}['checkpoint']['old_done'] is "
+                f"{numbers['old_done']}, expected {prev_done}"
+            )
+
+        history.append(_copy(checkpoint))
+        prev_to_cursor = to_cursor
+        prev_done = numbers["done"]
+
+    last_item = checkpoints[-1]
+    last_checkpoint = last_item["checkpoint"]
+    return {
+        "state": [
+            last_checkpoint["next_cursor"],
+            last_checkpoint["done"],
+            last_checkpoint["remaining"],
+        ],
+        "history": history,
+        "pending": _copy(last_item["pending"]),
+        "hits": _copy(last_item["hits"]),
     }
 
 
