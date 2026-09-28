@@ -71,6 +71,7 @@ __all__ = [
     "risk_interval",
     "risk_probability",
     "risk_share",
+    "robust_policy_change_summary",
     "robust_policy_grid",
     "robust_policy_grid_regions",
     "robust_policy_grid_turns",
@@ -9879,6 +9880,162 @@ def robust_policy_joint(
         "regions": regions,
         "branches": branches,
         "adjacency_changes": adjacency_changes,
+    }
+
+
+def robust_policy_change_summary(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Per-region branch-event counts and cross-axis change agreement.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_joint` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_joint` is called exactly once to
+    obtain the joint result ``J`` and :func:`robust_policy_lineage`
+    exactly once to obtain the lineage result ``L``.
+
+    The ``nodes`` of each axis of ``L`` map that axis's node ids to
+    their regions; the regions touched by a branch of ``J`` are the
+    union of the mapped ``from`` and ``to`` node ids, so one branch
+    counts at most once per region and axis/kind slot.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``regions``, ``consistent`` and ``conflicts``: the first two are
+    recursive list copies of the same-named entries of ``J``.
+
+    ``regions`` lists, in ascending region order (the same region set
+    as ``J``), one ``[region, B, RI, LI]`` entry per region. ``B``
+    holds six branch-event counts ordered by axis (budget then z) and
+    within an axis by ``split``, ``merge`` and ``merge_split``. ``RI``
+    and ``LI`` are ``math.fsum`` totals of, respectively, the absolute
+    rank-difference and level-difference elements of the
+    ``adjacency_changes`` entries of ``J`` whose region pair has the
+    region as an endpoint.
+
+    Every unordered region pair appearing among the
+    ``adjacency_changes`` of both axes collects, per axis and in the
+    original order of ``J``, ``[action, rank_diff_copy,
+    level_diff_copy]`` triples. Pairs whose two axis lists compare
+    equal go to ``consistent`` and the rest to ``conflicts``; each
+    entry is ``[small_region, large_region, budget_list, z_list]`` and
+    the lists are ordered by ascending region pair.
+
+    All containers are JSON-compatible and no value is rounded.
+    """
+    joint = robust_policy_joint(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+    lineage = robust_policy_lineage(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    axis_names = ("budget", "z")
+    kind_slot = {"split": 0, "merge": 1, "merge_split": 2}
+
+    # Same-axis L nodes map a branch's node ids to their regions.
+    region_of_node: dict[str, dict[int, int]] = {
+        axis_name: {
+            node[0]: node[5]
+            for node in lineage["axes"][axis_name]["nodes"]
+        }
+        for axis_name in axis_names
+    }
+
+    # Six branch-event counters per region: axis (budget, z) times
+    # kind (split, merge, merge_split); one branch counts once per
+    # region in its from/to region union.
+    counts: dict[int, list[int]] = {}
+    for branch in joint["branches"]:
+        axis_name = branch[0]
+        kind = branch[2]
+        touched = {
+            region_of_node[axis_name][node_id]
+            for node_id in (branch[3] + branch[4])
+        }
+        slot = (0 if axis_name == "budget" else 3) + kind_slot[kind]
+        for region_id in touched:
+            bag = counts.setdefault(region_id, [0, 0, 0, 0, 0, 0])
+            bag[slot] += 1
+
+    # Absolute rank/level difference elements at region endpoints, and
+    # per-axis [action, rank_diff copy, level_diff copy] unfoldings for
+    # every unordered region pair, all in the original order of J.
+    rank_abs: dict[int, list[float]] = {}
+    level_abs: dict[int, list[float]] = {}
+    pair_entries: dict[tuple[int, int], dict[str, list[list]]] = {}
+    for record in joint["adjacency_changes"]:
+        (
+            axis_name,
+            _earlier,
+            _later,
+            action,
+            small,
+            large,
+            rank_diff,
+            level_diff,
+        ) = record
+        for region_id in {small, large}:
+            rank_abs.setdefault(region_id, []).extend(
+                abs(item) for item in rank_diff
+            )
+            level_abs.setdefault(region_id, []).extend(
+                abs(item) for item in level_diff
+            )
+        entries = pair_entries.setdefault(
+            (small, large), {"budget": [], "z": []}
+        )
+        entries[axis_name].append(
+            [action, list(rank_diff), list(level_diff)]
+        )
+
+    regions: list[list] = []
+    for entry in joint["regions"]:
+        region_id = entry[0]
+        regions.append(
+            [
+                region_id,
+                list(counts.get(region_id, (0, 0, 0, 0, 0, 0))),
+                math.fsum(rank_abs.get(region_id, ())),
+                math.fsum(level_abs.get(region_id, ())),
+            ]
+        )
+
+    consistent: list[list] = []
+    conflicts: list[list] = []
+    for small, large in sorted(pair_entries):
+        per_axis = pair_entries[(small, large)]
+        budget_list = per_axis["budget"]
+        z_list = per_axis["z"]
+        if not budget_list or not z_list:
+            continue
+        item = [small, large, budget_list, z_list]
+        if budget_list == z_list:
+            consistent.append(item)
+        else:
+            conflicts.append(item)
+
+    return {
+        "budgets": _copy(joint["budgets"]),
+        "z": _copy(joint["z"]),
+        "regions": regions,
+        "consistent": consistent,
+        "conflicts": conflicts,
     }
 
 
