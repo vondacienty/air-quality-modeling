@@ -71,6 +71,7 @@ __all__ = [
     "risk_interval",
     "risk_probability",
     "risk_share",
+    "robust_policy_action_audit",
     "robust_policy_action_batches",
     "robust_policy_action_checkpoint",
     "robust_policy_action_commit",
@@ -11211,6 +11212,142 @@ def robust_policy_action_commit(
         "confirmed": confirmed,
         "pending": pending,
         "hits": _copy(resumed["hits"]),
+    }
+
+
+def robust_policy_action_audit(
+    checkpoints: list | tuple,
+    attempts: list | tuple,
+    cursor: int = 0,
+    expected_done: int = 0,
+) -> dict:
+    """Audit a sequence of wave commits against the recorded checkpoints.
+
+    ``checkpoints``, ``cursor`` and ``expected_done`` share the
+    contract of :func:`robust_policy_action_restore` (every
+    ``TypeError`` and ``ValueError`` is inherited verbatim; exceptions
+    propagate unchanged). ``attempts`` must be a list or tuple with
+    exactly one fewer item than ``checkpoints``; a wrong container type
+    raises ``TypeError`` and a length mismatch raises ``ValueError``.
+    Every item must be a two-element list or tuple ``(completed,
+    failed)``; a wrong type or arity raises ``ValueError``.
+    ``completed`` must be a non-bool int >= 0 and ``failed`` a
+    ``bool``; a wrong type raises ``TypeError`` and a negative
+    ``completed`` raises ``ValueError``.
+
+    :func:`robust_policy_action_restore` is called exactly once to
+    obtain ``S``. For each index ``i``,
+    :func:`robust_policy_action_commit` is called once as
+    ``robust_policy_action_commit(C[:i + 1], c, f, cursor,
+    expected_done)`` where ``(c, f)`` is ``attempts[i]`` and ``C`` is
+    ``checkpoints``; any exception propagates unchanged, and a result
+    not equal to ``C[i + 1]`` raises ``RuntimeError``.
+
+    ``retry`` is true when ``i > 0``, ``attempts[i - 1]``'s ``failed``
+    flag is true and ``c + int(f) > 0``. ``history[i]`` is
+    ``[i, c, f, retry, copy(C[i + 1]["checkpoint"])]``.
+
+    Returns a dict whose keys in order are ``state``, ``history``,
+    ``pending``, ``hits`` and ``summary``: ``state``, ``pending`` and
+    ``hits`` recursively copy ``S``'s same-named values, and
+    ``summary`` is ``[len(attempts), sum of c, count of true f, count
+    of true retry, S["state"][1], S["state"][2]]``. Every container is
+    JSON-compatible and the inputs are never modified.
+    """
+    restored = robust_policy_action_restore(checkpoints, cursor, expected_done)
+
+    if not isinstance(attempts, (list, tuple)):
+        raise TypeError(
+            "attempts must be a list or tuple, got "
+            f"{type(attempts).__name__}"
+        )
+    if len(attempts) != len(checkpoints) - 1:
+        raise ValueError(
+            f"attempts must have {len(checkpoints) - 1} items, got "
+            f"{len(attempts)}"
+        )
+    for index, attempt in enumerate(attempts):
+        prefix = f"attempts[{index}]"
+        if not isinstance(attempt, (list, tuple)):
+            raise TypeError(
+                f"{prefix} must be a list or tuple, got "
+                f"{type(attempt).__name__}"
+            )
+        if len(attempt) != 2:
+            raise ValueError(
+                f"{prefix} must have exactly 2 items, got {len(attempt)}"
+            )
+        completed, failed = attempt
+        if not isinstance(completed, int) or isinstance(completed, bool):
+            raise TypeError(
+                f"{prefix}[0] must be an int, got "
+                f"{type(completed).__name__}"
+            )
+        if not isinstance(failed, bool):
+            raise TypeError(
+                f"{prefix}[1] must be a bool, got {type(failed).__name__}"
+            )
+        if completed < 0:
+            raise ValueError(
+                f"{prefix}[0] must be >= 0, got {completed}"
+            )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    history: list = []
+    sum_completed = 0
+    count_failed = 0
+    count_retry = 0
+    for index, (completed, failed) in enumerate(attempts):
+        committed = robust_policy_action_commit(
+            checkpoints[:index + 1],
+            completed,
+            failed,
+            cursor,
+            expected_done,
+        )
+        if committed != checkpoints[index + 1]:
+            raise RuntimeError(
+                f"attempts[{index}] commit result does not match "
+                f"checkpoints[{index + 1}]"
+            )
+        retry = (
+            index > 0
+            and bool(attempts[index - 1][1])
+            and completed + int(failed) > 0
+        )
+        history.append(
+            [
+                index,
+                completed,
+                failed,
+                retry,
+                _copy(checkpoints[index + 1]["checkpoint"]),
+            ]
+        )
+        sum_completed += completed
+        count_failed += int(failed)
+        count_retry += int(retry)
+
+    state = restored["state"]
+    return {
+        "state": _copy(state),
+        "history": history,
+        "pending": _copy(restored["pending"]),
+        "hits": _copy(restored["hits"]),
+        "summary": [
+            len(attempts),
+            sum_completed,
+            count_failed,
+            count_retry,
+            state[1],
+            state[2],
+        ],
     }
 
 
