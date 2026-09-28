@@ -73,6 +73,7 @@ __all__ = [
     "risk_share",
     "robust_policy_action_batches",
     "robust_policy_action_checkpoint",
+    "robust_policy_action_commit",
     "robust_policy_action_confirm",
     "robust_policy_action_progress",
     "robust_policy_action_restore",
@@ -11100,6 +11101,116 @@ def robust_policy_action_resume(
         "pending": left,
         "hits": _copy(restored["hits"]),
         "history": _copy(restored["history"]),
+    }
+
+
+def robust_policy_action_commit(
+    checkpoints: list | tuple,
+    completed: int,
+    failed: bool = False,
+    cursor: int = 0,
+    expected_done: int = 0,
+) -> dict:
+    """Commit a wave run: mark completions done and roll the rest back.
+
+    ``checkpoints``, ``cursor`` and ``expected_done`` share the
+    contract of :func:`robust_policy_action_resume` (every
+    ``TypeError`` and ``ValueError`` is inherited verbatim; exceptions
+    propagate unchanged). ``completed`` must be a non-bool int >= 0 and
+    ``failed`` a ``bool``; a wrong type raises ``TypeError`` and a
+    negative ``completed`` raises ``ValueError``.
+
+    :func:`robust_policy_action_resume` is called exactly once with
+    ``limit=max(1, completed + int(failed))`` to obtain ``S``; the
+    requested count ``completed + int(failed)`` must not exceed the
+    length of ``S["plan"]`` or a ``ValueError`` is raised.
+
+    ``C`` recursively copies the first ``completed`` items of
+    ``S["plan"]`` with every status (entry 0) replaced by ``"done"``.
+    ``P`` recursively copies ``S["plan"][completed:] + S["pending"]``,
+    so the failed item and every unconfirmed item roll back to pending.
+    With ``[c, d, r] = S["state"]``, when ``C`` is empty
+    ``nc, nd, nr = c, d, r``; otherwise ``nc = C[-1][-1]``,
+    ``nd = C[-1][2]`` and ``nr = r - nd + d``.
+
+    Returns a dict in the shape of a
+    :func:`robust_policy_action_checkpoint` result, with keys in order
+    ``budgets``, ``z``, ``capacity``, ``checkpoint``, ``confirmed``,
+    ``pending`` and ``hits``: ``budgets``, ``z`` and ``capacity``
+    recursively copy the last input checkpoint's same-named values,
+    ``confirmed`` is ``C``, ``pending`` is ``P`` and ``hits``
+    recursively copies ``S["hits"]``. The ``checkpoint`` dict keeps the
+    established key order ``from_cursor``, ``to_cursor``,
+    ``next_cursor``, ``old_done``, ``done``, ``delta`` and
+    ``remaining``, with values ``[c, nc, nc, d, nd, nd - d, nr]``. The
+    result may be appended to ``checkpoints`` for later restore or
+    resume calls. Every list is recursively copied, every container is
+    JSON-compatible, ``None`` values are preserved and no value is
+    rounded.
+    """
+    if not isinstance(completed, int) or isinstance(completed, bool):
+        raise TypeError(
+            f"completed must be an int, got {type(completed).__name__}"
+        )
+    if completed < 0:
+        raise ValueError(f"completed must be >= 0, got {completed}")
+    if not isinstance(failed, bool):
+        raise TypeError(
+            f"failed must be a bool, got {type(failed).__name__}"
+        )
+
+    requested = completed + int(failed)
+    resumed = robust_policy_action_resume(
+        checkpoints, cursor, expected_done,
+        limit=max(1, requested),
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    plan = resumed["plan"]
+    if requested > len(plan):
+        raise ValueError(
+            f"requested {requested} actions but the plan has only "
+            f"{len(plan)}"
+        )
+
+    confirmed: list[list] = []
+    for item in plan[:completed]:
+        entry = _copy(item)
+        entry[0] = "done"
+        confirmed.append(entry)
+    pending = _copy([*plan[completed:], *resumed["pending"]])
+
+    c, d, r = resumed["state"]
+    if not confirmed:
+        nc, nd, nr = c, d, r
+    else:
+        nc = confirmed[-1][-1]
+        nd = confirmed[-1][2]
+        nr = r - nd + d
+
+    last_item = checkpoints[-1]
+    return {
+        "budgets": _copy(last_item["budgets"]),
+        "z": _copy(last_item["z"]),
+        "capacity": last_item["capacity"],
+        "checkpoint": {
+            "from_cursor": c,
+            "to_cursor": nc,
+            "next_cursor": nc,
+            "old_done": d,
+            "done": nd,
+            "delta": nd - d,
+            "remaining": nr,
+        },
+        "confirmed": confirmed,
+        "pending": pending,
+        "hits": _copy(resumed["hits"]),
     }
 
 
