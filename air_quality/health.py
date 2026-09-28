@@ -77,6 +77,7 @@ __all__ = [
     "robust_policy_grid_turns",
     "robust_policy_joint",
     "robust_policy_lineage",
+    "robust_policy_priority",
     "robust_policy_region_flow",
     "robust_policy_report",
     "robust_policy_sensitivity",
@@ -10036,6 +10037,123 @@ def robust_policy_change_summary(
         "regions": regions,
         "consistent": consistent,
         "conflicts": conflicts,
+    }
+
+
+def robust_policy_priority(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Conflict-prioritized ranking of regions and region pairs.
+
+    Every parameter shares the contract of
+    :func:`robust_policy_change_summary` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_change_summary` is called exactly
+    once to obtain the summary result ``S``.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``regions`` and ``pairs``: the first two are recursive list copies
+    of the same-named entries of ``S``.
+
+    Each ``[a, b, BA, ZA]`` conflict of ``S`` contributes a
+    ``[a, b, C, RI, LI, BA_copy, ZA_copy]`` entry, where ``C`` is the
+    total number of ``[action, rank_diff, level_diff]`` triples across
+    both axes, ``RI`` is the ``math.fsum`` of the absolute
+    rank-difference elements and ``LI`` the ``math.fsum`` of the
+    absolute level-difference elements over both axis lists. Entries
+    are ordered by ascending ``(-LI, -RI, -C, a, b)``.
+
+    For each ``[r, B, RI, LI]`` region of ``S``, the details list
+    collects the conflicts involving ``r`` as
+    ``[other_region, BA_copy, ZA_copy]`` ordered by ascending other
+    region. The region entry is
+    ``[r, B_copy, fsum(B), RI, LI, len(details), details]`` and entries
+    are ordered by ascending
+    ``(-len(details), -LI, -RI, -fsum(B), r)``.
+
+    All containers are JSON-compatible, ``None`` values are preserved
+    and no value is rounded.
+    """
+    summary = robust_policy_change_summary(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    fsum = math.fsum
+
+    pairs: list[list] = []
+    for a, b, budget_list, z_list in summary["conflicts"]:
+        rank_values = [
+            abs(x)
+            for entry in budget_list + z_list
+            for x in entry[1]
+        ]
+        level_values = [
+            abs(x)
+            for entry in budget_list + z_list
+            for x in entry[2]
+        ]
+        pairs.append(
+            [
+                a,
+                b,
+                len(budget_list) + len(z_list),
+                fsum(rank_values),
+                fsum(level_values),
+                _copy(budget_list),
+                _copy(z_list),
+            ]
+        )
+    pairs.sort(key=lambda item: (-item[4], -item[3], -item[2], item[0], item[1]))
+
+    regions: list[list] = []
+    for r, counts, rank_total, level_total in summary["regions"]:
+        details: list[list] = []
+        for a, b, budget_list, z_list in summary["conflicts"]:
+            if a == r:
+                details.append([b, _copy(budget_list), _copy(z_list)])
+            elif b == r:
+                details.append([a, _copy(budget_list), _copy(z_list)])
+        details.sort(key=lambda item: item[0])
+        regions.append(
+            [
+                r,
+                _copy(counts),
+                fsum(counts),
+                rank_total,
+                level_total,
+                len(details),
+                details,
+            ]
+        )
+    regions.sort(
+        key=lambda item: (
+            -item[5],
+            -item[4],
+            -item[3],
+            -item[2],
+            item[0],
+        )
+    )
+
+    return {
+        "budgets": _copy(summary["budgets"]),
+        "z": _copy(summary["z"]),
+        "regions": regions,
+        "pairs": pairs,
     }
 
 
