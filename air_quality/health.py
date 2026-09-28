@@ -71,6 +71,7 @@ __all__ = [
     "risk_interval",
     "risk_probability",
     "risk_share",
+    "robust_policy_action_batches",
     "robust_policy_actions",
     "robust_policy_change_summary",
     "robust_policy_grid",
@@ -10239,6 +10240,104 @@ def robust_policy_actions(
         "budgets": _copy(priority["budgets"]),
         "z": _copy(priority["z"]),
         "queue": queue,
+    }
+
+
+def robust_policy_action_batches(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+    capacity: int = 10,
+) -> dict:
+    """Conflict-priority action queue split into fixed-size batches.
+
+    Every parameter except ``capacity`` shares the contract of
+    :func:`robust_policy_actions` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`robust_policy_actions` is called exactly once to
+    obtain ``A``. ``capacity`` must be a non-bool int >= 1; a wrong type
+    raises ``TypeError`` and a value below 1 raises ``ValueError``.
+
+    ``A["queue"]`` is sliced in its original order, ``capacity`` actions
+    per batch (the last batch may be shorter). For a ``"region"`` action
+    its 0-based entries 7 and 8 are the rank and level impact; for a
+    ``"pair"`` action its 0-based entries 6 and 7 are. Within each batch
+    those impacts are summed with ``math.fsum`` to give ``R`` and ``L``;
+    ``CR`` and ``CL`` are the ``math.fsum`` of every ``R`` and ``L`` up
+    to and including that batch.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``capacity`` and ``batches``: the first two values copy the
+    same-named values of ``A``, and each batch is a dict whose keys in
+    order are ``id``, ``range``, ``items``, ``rank``, ``level`` and
+    ``cumulative``, with values the 0-based batch id, the half-open
+    interval ``[start, stop]`` of queue indices, recursive copies of the
+    actions, ``R``, ``L`` and ``[CR, CL]``. An empty queue gives empty
+    ``batches``. Every container is JSON-compatible, ``None`` is
+    preserved and no value is rounded.
+    """
+    if not isinstance(capacity, int) or isinstance(capacity, bool):
+        raise TypeError(
+            f"capacity must be an int, got {type(capacity).__name__}"
+        )
+    if capacity < 1:
+        raise ValueError(f"capacity must be >= 1, got {capacity}")
+
+    actions = robust_policy_actions(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    queue = actions["queue"]
+    batches: list[dict] = []
+    cumulative_rank: list[float] = []
+    cumulative_level: list[float] = []
+    for batch_id, start in enumerate(range(0, len(queue), capacity)):
+        stop = min(start + capacity, len(queue))
+        items = queue[start:stop]
+        rank_terms: list[float] = []
+        level_terms: list[float] = []
+        for action in items:
+            if action[1] == "region":
+                rank_terms.append(action[7])
+                level_terms.append(action[8])
+            else:
+                rank_terms.append(action[6])
+                level_terms.append(action[7])
+        rank_total = math.fsum(rank_terms)
+        level_total = math.fsum(level_terms)
+        cumulative_rank.append(rank_total)
+        cumulative_level.append(level_total)
+        batches.append(
+            {
+                "id": batch_id,
+                "range": [start, stop],
+                "items": [_copy(action) for action in items],
+                "rank": rank_total,
+                "level": level_total,
+                "cumulative": [
+                    math.fsum(cumulative_rank),
+                    math.fsum(cumulative_level),
+                ],
+            }
+        )
+
+    return {
+        "budgets": _copy(actions["budgets"]),
+        "z": _copy(actions["z"]),
+        "capacity": capacity,
+        "batches": batches,
     }
 
 
