@@ -12,6 +12,7 @@ __all__ = [
     "aggregate_correlated",
     "any_receptor_probability",
     "assess",
+    "audit_delta",
     "at_least_count_probability",
     "exceedance_probability",
     "excess_interval",
@@ -11598,6 +11599,17 @@ def robust_policy_action_audit_chain(audits: list | tuple) -> dict:
                         f"{prev_checkpoint['done']}, got "
                         f"{numbers['old_done']}"
                     )
+                expected_remaining = (
+                    prev_checkpoint["remaining"] - numbers["delta"]
+                )
+                if numbers["remaining"] != expected_remaining:
+                    raise ValueError(
+                        f"{entry_prefix}[4]['remaining'] must equal the "
+                        f"previous checkpoint's remaining "
+                        f"{prev_checkpoint['remaining']} minus this "
+                        f"checkpoint's delta {numbers['delta']} "
+                        f"({expected_remaining}), got {numbers['remaining']}"
+                    )
             prev_checkpoint = numbers
             prev_failed = failed
             seg_completed += completed
@@ -11764,6 +11776,433 @@ def robust_policy_action_audit_chain(audits: list | tuple) -> dict:
             last_state[1],
             last_state[2],
         ],
+    }
+
+
+def audit_delta(previous: dict, current: dict) -> dict:
+    """Difference between two :func:`robust_policy_action_audit_chain` results.
+
+    The two arguments (denoted ``P`` and ``C`` below) must each conform
+    to the return contract of :func:`robust_policy_action_audit_chain`:
+    a dict with keys exactly ``state``, ``history``, ``retry_chains``,
+    ``pending``, ``hits`` and ``summary``. A wrong argument type (or any
+    wrong inner type) raises ``TypeError``; any malformed structure,
+    inconsistent statistic or broken recursion raises ``ValueError``.
+
+    In addition, ``C["history"]`` must have ``P["history"]`` as a
+    prefix; otherwise ``ValueError``. When the suffix is non-empty, the
+    first suffix checkpoint must satisfy
+    ``[from_cursor, old_done, remaining] == [P["state"][0],
+    P["state"][1], P["state"][2] - delta]``; when the suffix is empty
+    the two states must be equal. Any mismatch raises ``ValueError``.
+
+    ``D`` is the seven-item list ``C["summary"][i] - P["summary"][i]``
+    in summary order (segment count, attempt count, completed sum,
+    failed count, retry count, done, remaining). The first six items
+    must be ``>= 0`` and the last one ``<= 0`` (a sign violation raises
+    ``ValueError``), and the increments must be consistent with the
+    suffix: item 1 must equal the suffix length, items 2, 3 and 4 must
+    equal the suffix sums of ``completed``, true ``failed`` and true
+    ``retry``, item 0 must be at least the number of distinct segment
+    indices appearing in the suffix, and items 5 and 6 must equal
+    ``C["state"][1] - P["state"][1]`` and
+    ``C["state"][2] - P["state"][2]``. An inconsistent increment raises
+    ``RuntimeError``.
+
+    Retry chains are compared value-by-value (a chain equals another
+    when their three items are equal); common chains cancel pairwise
+    in ``C`` order. Returns a dict whose keys in order are ``states``,
+    ``delta``, ``history`` and ``retries``: ``states`` is
+    ``[P["state"] copy, C["state"] copy]``, ``delta`` is ``D``,
+    ``history`` is the suffix of ``C["history"]`` and ``retries`` is
+    ``[C-only chains, P-only chains]``, each side keeping its original
+    order. Every container is recursively copied and JSON-compatible;
+    the inputs are never modified.
+    """
+    result_keys = (
+        "state",
+        "history",
+        "retry_chains",
+        "pending",
+        "hits",
+        "summary",
+    )
+    checkpoint_keys = (
+        "from_cursor",
+        "to_cursor",
+        "next_cursor",
+        "old_done",
+        "done",
+        "delta",
+        "remaining",
+    )
+
+    def _non_negative_int(prefix: str, value: object) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(
+                f"{prefix} must be a non-bool int, got "
+                f"{type(value).__name__}"
+            )
+        if value < 0:
+            raise ValueError(f"{prefix} must be >= 0, got {value}")
+        return value
+
+    def _validate_chain(name: str, value: object) -> dict:
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"{name} must be a dict, got {type(value).__name__}"
+            )
+        if set(value.keys()) != set(result_keys):
+            raise ValueError(
+                f"{name} must be a dict with keys {list(result_keys)!r}, "
+                f"got keys {list(value)!r}"
+            )
+
+        state = value["state"]
+        history = value["history"]
+        retry_chains = value["retry_chains"]
+        summary = value["summary"]
+
+        if not isinstance(state, list):
+            raise TypeError(
+                f"{name}['state'] must be a list, got "
+                f"{type(state).__name__}"
+            )
+        if len(state) != 3:
+            raise ValueError(
+                f"{name}['state'] must have exactly 3 items, got "
+                f"{len(state)}"
+            )
+        for s_index, s_value in enumerate(state):
+            _non_negative_int(f"{name}['state'][{s_index}]", s_value)
+
+        for list_name in ("pending", "hits"):
+            if not isinstance(value[list_name], list):
+                raise TypeError(
+                    f"{name}[{list_name!r}] must be a list, got "
+                    f"{type(value[list_name]).__name__}"
+                )
+
+        if not isinstance(history, list):
+            raise TypeError(
+                f"{name}['history'] must be a list, got "
+                f"{type(history).__name__}"
+            )
+
+        total_completed = 0
+        total_failed = 0
+        total_retry = 0
+        current_segment = -1
+        local_counter = 0
+        prev_checkpoint: dict[str, int] | None = None
+        failed_flags: list[bool] = []
+        retry_flags: list[bool] = []
+        for global_index, entry in enumerate(history):
+            entry_prefix = f"{name}['history'][{global_index}]"
+            if not isinstance(entry, list):
+                raise TypeError(
+                    f"{entry_prefix} must be a list, got "
+                    f"{type(entry).__name__}"
+                )
+            if len(entry) != 7:
+                raise ValueError(
+                    f"{entry_prefix} must have exactly 7 items, got "
+                    f"{len(entry)}"
+                )
+            global_no, segment_no, local_no, completed, failed, retry, checkpoint = entry
+            _non_negative_int(f"{entry_prefix}[0]", global_no)
+            _non_negative_int(f"{entry_prefix}[1]", segment_no)
+            _non_negative_int(f"{entry_prefix}[2]", local_no)
+            _non_negative_int(f"{entry_prefix}[3]", completed)
+            if not isinstance(failed, bool):
+                raise TypeError(
+                    f"{entry_prefix}[4] must be a bool, got "
+                    f"{type(failed).__name__}"
+                )
+            if not isinstance(retry, bool):
+                raise TypeError(
+                    f"{entry_prefix}[5] must be a bool, got "
+                    f"{type(retry).__name__}"
+                )
+            if global_no != global_index:
+                raise ValueError(
+                    f"{entry_prefix}[0] must be the 0-based global index "
+                    f"{global_index}, got {global_no}"
+                )
+            if segment_no < current_segment:
+                raise ValueError(
+                    f"{entry_prefix}[1] segment indices must be "
+                    f"non-decreasing, got {segment_no} after "
+                    f"{current_segment}"
+                )
+            same_segment = segment_no == current_segment
+            if not same_segment:
+                current_segment = segment_no
+                local_counter = 0
+            if local_no != local_counter:
+                raise ValueError(
+                    f"{entry_prefix}[2] must be the 0-based local index "
+                    f"{local_counter}, got {local_no}"
+                )
+            local_counter += 1
+            expected_retry = (
+                global_index > 0
+                and failed_flags[-1]
+                and completed + int(failed) > 0
+            )
+            if retry != expected_retry:
+                raise ValueError(
+                    f"{entry_prefix}[5] retry flag must be {expected_retry}"
+                )
+            failed_flags.append(failed)
+            retry_flags.append(retry)
+
+            if not isinstance(checkpoint, dict):
+                raise TypeError(
+                    f"{entry_prefix}[6] must be a dict, got "
+                    f"{type(checkpoint).__name__}"
+                )
+            if set(checkpoint.keys()) != set(checkpoint_keys):
+                raise ValueError(
+                    f"{entry_prefix}[6] must be a dict with keys "
+                    f"{list(checkpoint_keys)!r}, got keys "
+                    f"{list(checkpoint)!r}"
+                )
+            numbers: dict[str, int] = {}
+            for key in checkpoint_keys:
+                numbers[key] = _non_negative_int(
+                    f"{entry_prefix}[6][{key!r}]", checkpoint[key]
+                )
+            if numbers["next_cursor"] != numbers["to_cursor"]:
+                raise ValueError(
+                    f"{entry_prefix}[6]['next_cursor'] must equal "
+                    f"'to_cursor' ({numbers['to_cursor']}), got "
+                    f"{numbers['next_cursor']}"
+                )
+            if numbers["delta"] != numbers["done"] - numbers["old_done"]:
+                raise ValueError(
+                    f"{entry_prefix}[6]['delta'] must equal done - "
+                    f"old_done ({numbers['done'] - numbers['old_done']}), "
+                    f"got {numbers['delta']}"
+                )
+            if numbers["to_cursor"] < numbers["from_cursor"]:
+                raise ValueError(
+                    f"{entry_prefix}[6] cursor must not move backwards: "
+                    f"from_cursor={numbers['from_cursor']}, "
+                    f"to_cursor={numbers['to_cursor']}"
+                )
+            if prev_checkpoint is not None:
+                if numbers["from_cursor"] != prev_checkpoint["to_cursor"]:
+                    raise ValueError(
+                        f"{entry_prefix}[6]['from_cursor'] must equal the "
+                        f"previous checkpoint's to_cursor "
+                        f"{prev_checkpoint['to_cursor']}, got "
+                        f"{numbers['from_cursor']}"
+                    )
+                if numbers["old_done"] != prev_checkpoint["done"]:
+                    raise ValueError(
+                        f"{entry_prefix}[6]['old_done'] must equal the "
+                        f"previous checkpoint's done "
+                        f"{prev_checkpoint['done']}, got "
+                        f"{numbers['old_done']}"
+                    )
+                if same_segment:
+                    expected_remaining = (
+                        prev_checkpoint["remaining"] - numbers["delta"]
+                    )
+                    if numbers["remaining"] != expected_remaining:
+                        raise ValueError(
+                            f"{entry_prefix}[6]['remaining'] must equal the "
+                            f"previous checkpoint's remaining "
+                            f"{prev_checkpoint['remaining']} minus this "
+                            f"checkpoint's delta {numbers['delta']} "
+                            f"({expected_remaining}), got "
+                            f"{numbers['remaining']}"
+                        )
+            prev_checkpoint = numbers
+            total_completed += completed
+            total_failed += int(failed)
+            total_retry += int(retry)
+
+        if history:
+            last_checkpoint = history[-1][6]
+            expected_state = [
+                last_checkpoint["next_cursor"],
+                last_checkpoint["done"],
+                last_checkpoint["remaining"],
+            ]
+            if state != expected_state:
+                raise ValueError(
+                    f"{name}['state'] must equal the last history "
+                    f"checkpoint state {expected_state!r}, got {state!r}"
+                )
+
+        if not isinstance(summary, list):
+            raise TypeError(
+                f"{name}['summary'] must be a list, got "
+                f"{type(summary).__name__}"
+            )
+        if len(summary) != 7:
+            raise ValueError(
+                f"{name}['summary'] must have exactly 7 items, got "
+                f"{len(summary)}"
+            )
+        for s_index, s_value in enumerate(summary):
+            _non_negative_int(f"{name}['summary'][{s_index}]", s_value)
+
+        minimum_segments = current_segment + 1 if history else 1
+        if summary[0] < minimum_segments:
+            raise ValueError(
+                f"{name}['summary'][0] must be a segment count >= "
+                f"{minimum_segments}, got {summary[0]}"
+            )
+        expected_summary = [
+            summary[0],
+            len(history),
+            total_completed,
+            total_failed,
+            total_retry,
+            state[1],
+            state[2],
+        ]
+        if summary[1:] != expected_summary[1:]:
+            raise ValueError(
+                f"{name}['summary'] must equal {expected_summary!r}, got "
+                f"{list(summary)!r}"
+            )
+
+        if not isinstance(retry_chains, list):
+            raise TypeError(
+                f"{name}['retry_chains'] must be a list, got "
+                f"{type(retry_chains).__name__}"
+            )
+        expected_chains: list = []
+        chain_start = 0
+        while chain_start < len(retry_flags):
+            if not retry_flags[chain_start]:
+                chain_start += 1
+                continue
+            chain_end = chain_start
+            while (
+                chain_end + 1 < len(retry_flags)
+                and retry_flags[chain_end + 1]
+            ):
+                chain_end += 1
+            expected_chains.append(
+                [
+                    chain_start,
+                    chain_end,
+                    list(range(chain_start, chain_end + 1)),
+                ]
+            )
+            chain_start = chain_end + 1
+        if retry_chains != expected_chains:
+            raise ValueError(
+                f"{name}['retry_chains'] must equal {expected_chains!r}, "
+                f"got {retry_chains!r}"
+            )
+
+        return value
+
+    p_chain = _validate_chain("previous", previous)
+    c_chain = _validate_chain("current", current)
+
+    p_history = p_chain["history"]
+    c_history = c_chain["history"]
+    p_state = p_chain["state"]
+    c_state = c_chain["state"]
+
+    prefix_len = len(p_history)
+    if len(c_history) < prefix_len or c_history[:prefix_len] != p_history:
+        raise ValueError(
+            "current['history'] must have previous['history'] as a "
+            f"prefix of length {prefix_len}"
+        )
+    suffix = c_history[prefix_len:]
+
+    if suffix:
+        first_checkpoint = suffix[0][6]
+        expected_remaining = p_state[2] - first_checkpoint["delta"]
+        if (
+            first_checkpoint["from_cursor"] != p_state[0]
+            or first_checkpoint["old_done"] != p_state[1]
+            or first_checkpoint["remaining"] != expected_remaining
+        ):
+            raise ValueError(
+                "the first suffix checkpoint must continue the previous "
+                f"state {p_state!r}: expected "
+                f"[from_cursor, old_done, remaining] = "
+                f"[{p_state[0]}, {p_state[1]}, {expected_remaining}], "
+                f"got [{first_checkpoint['from_cursor']}, "
+                f"{first_checkpoint['old_done']}, "
+                f"{first_checkpoint['remaining']}]"
+            )
+    elif c_state != p_state:
+        raise ValueError(
+            "with an empty history suffix, current['state'] must equal "
+            f"previous['state'] {p_state!r}, got {c_state!r}"
+        )
+
+    p_summary = p_chain["summary"]
+    c_summary = c_chain["summary"]
+    delta = [c_summary[i] - p_summary[i] for i in range(7)]
+    for index in range(6):
+        if delta[index] < 0:
+            raise ValueError(
+                f"delta[{index}] must be >= 0, got {delta[index]}"
+            )
+    if delta[6] > 0:
+        raise ValueError(f"delta[6] must be <= 0, got {delta[6]}")
+
+    suffix_attempts = len(suffix)
+    suffix_completed = sum(entry[3] for entry in suffix)
+    suffix_failed = sum(int(entry[4]) for entry in suffix)
+    suffix_retry = sum(int(entry[5]) for entry in suffix)
+    suffix_segments = len({entry[1] for entry in suffix})
+
+    def _increment_error(index: int, expected: int) -> RuntimeError:
+        return RuntimeError(
+            f"delta[{index}] must equal {expected}, got {delta[index]}"
+        )
+
+    if delta[0] < suffix_segments:
+        raise _increment_error(0, suffix_segments)
+    if delta[1] != suffix_attempts:
+        raise _increment_error(1, suffix_attempts)
+    if delta[2] != suffix_completed:
+        raise _increment_error(2, suffix_completed)
+    if delta[3] != suffix_failed:
+        raise _increment_error(3, suffix_failed)
+    if delta[4] != suffix_retry:
+        raise _increment_error(4, suffix_retry)
+    if delta[5] != c_state[1] - p_state[1]:
+        raise _increment_error(5, c_state[1] - p_state[1])
+    if delta[6] != c_state[2] - p_state[2]:
+        raise _increment_error(6, c_state[2] - p_state[2])
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    unmatched_p = list(p_chain["retry_chains"])
+    c_only: list = []
+    for chain in c_chain["retry_chains"]:
+        for index, candidate in enumerate(unmatched_p):
+            if candidate == chain:
+                del unmatched_p[index]
+                break
+        else:
+            c_only.append(_copy(chain))
+    p_only = [_copy(chain) for chain in unmatched_p]
+
+    return {
+        "states": [_copy(p_state), _copy(c_state)],
+        "delta": delta,
+        "history": _copy(suffix),
+        "retries": [c_only, p_only],
     }
 
 
