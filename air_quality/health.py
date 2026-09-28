@@ -13,6 +13,7 @@ __all__ = [
     "any_receptor_probability",
     "assess",
     "audit_delta",
+    "audit_reconcile",
     "at_least_count_probability",
     "exceedance_probability",
     "excess_interval",
@@ -11800,7 +11801,7 @@ def audit_delta(previous: dict, current: dict) -> dict:
     in summary order (segment count, attempt count, completed sum,
     failed count, retry count, done, remaining). The first six items
     must be ``>= 0`` and the last one ``<= 0`` (a sign violation raises
-    ``ValueError``), and the increments must be consistent with the
+    ``RuntimeError``), and the increments must be consistent with the
     suffix: item 1 must equal the suffix length, items 2, 3 and 4 must
     equal the suffix sums of ``completed``, true ``failed`` and true
     ``retry``, item 0 must be at least the number of distinct segment
@@ -12148,11 +12149,11 @@ def audit_delta(previous: dict, current: dict) -> dict:
     delta = [c_summary[i] - p_summary[i] for i in range(7)]
     for index in range(6):
         if delta[index] < 0:
-            raise ValueError(
+            raise RuntimeError(
                 f"delta[{index}] must be >= 0, got {delta[index]}"
             )
     if delta[6] > 0:
-        raise ValueError(f"delta[6] must be <= 0, got {delta[6]}")
+        raise RuntimeError(f"delta[6] must be <= 0, got {delta[6]}")
 
     suffix_attempts = len(suffix)
     suffix_completed = sum(entry[3] for entry in suffix)
@@ -12203,6 +12204,95 @@ def audit_delta(previous: dict, current: dict) -> dict:
         "delta": delta,
         "history": _copy(suffix),
         "retries": [c_only, p_only],
+    }
+
+
+def audit_reconcile(snapshots: list | tuple) -> dict:
+    """Reconcile a sequence of audit-chain snapshots with :func:`audit_delta`.
+
+    ``snapshots`` must be a non-empty list or tuple whose items each
+    conform to the return contract of
+    :func:`robust_policy_action_audit_chain`. A wrong container type or
+    any item of the wrong type raises ``TypeError``; an empty sequence
+    raises ``ValueError``.
+
+    The first snapshot is checked with ``audit_delta(S[0], S[0])``; for
+    each ``i`` from 1 to ``L - 1``, ``audit_delta(S[i - 1], S[i])`` is
+    called exactly once and any exception it raises propagates
+    unchanged. Its results form ``steps`` (empty when ``L == 1``).
+    ``delta`` is the seven-item list ``S[-1]["summary"][k] -
+    S[0]["summary"][k]`` in summary order; it must equal, item by item,
+    the totals obtained with :func:`sum` over the per-step deltas,
+    otherwise ``RuntimeError``.
+
+    ``retries`` starts as ``[[], []]`` and is built from the steps in
+    order, additions handled before removals for every step: the current
+    item is cancelled against the first equal item of the opposite
+    direction list, otherwise a recursive copy of it is appended to this
+    direction's list.
+
+    Returns a dict whose keys in order are ``states``, ``delta``,
+    ``steps`` and ``retries``: ``states`` is ``[S[0]["state"] copy,
+    S[-1]["state"] copy]`` and ``steps`` holds recursive copies of the
+    per-step delta results. Every container is recursively copied and
+    JSON-compatible; the input is never modified.
+    """
+    if not isinstance(snapshots, (list, tuple)):
+        raise TypeError(
+            "snapshots must be a list or tuple, got "
+            f"{type(snapshots).__name__}"
+        )
+    if len(snapshots) == 0:
+        raise ValueError("snapshots must not be empty")
+
+    audit_delta(snapshots[0], snapshots[0])
+    steps = []
+    for index in range(1, len(snapshots)):
+        steps.append(audit_delta(snapshots[index - 1], snapshots[index]))
+
+    first_summary = snapshots[0]["summary"]
+    last_summary = snapshots[-1]["summary"]
+    delta = [last_summary[i] - first_summary[i] for i in range(7)]
+    summed = [sum(step["delta"][i] for step in steps) for i in range(7)]
+    if delta != summed:
+        raise RuntimeError(
+            "end-to-end summary delta must equal the sum of the per-step "
+            f"deltas {summed!r}, got {delta!r}"
+        )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    added: list = []
+    removed: list = []
+    for step in steps:
+        for chain in step["retries"][0]:
+            for index, candidate in enumerate(removed):
+                if candidate == chain:
+                    del removed[index]
+                    break
+            else:
+                added.append(_copy(chain))
+        for chain in step["retries"][1]:
+            for index, candidate in enumerate(added):
+                if candidate == chain:
+                    del added[index]
+                    break
+            else:
+                removed.append(_copy(chain))
+
+    return {
+        "states": [
+            _copy(snapshots[0]["state"]),
+            _copy(snapshots[-1]["state"]),
+        ],
+        "delta": delta,
+        "steps": [_copy(step) for step in steps],
+        "retries": [added, removed],
     }
 
 
