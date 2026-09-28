@@ -11351,6 +11351,421 @@ def robust_policy_action_audit(
     }
 
 
+def robust_policy_action_audit_chain(audits: list | tuple) -> dict:
+    """Stitch per-segment wave audits into one global audit chain.
+
+    ``audits`` must be a non-empty list or tuple whose items conform to
+    the return contract of :func:`robust_policy_action_audit` and are
+    internally self-consistent; a wrong container type raises
+    ``TypeError`` and an empty container raises ``ValueError``. Each
+    item must be a dict with exactly the keys ``state``, ``history``,
+    ``pending``, ``hits`` and ``summary``; ``state`` must be a
+    three-element list of non-bool ints >= 0, ``pending`` and ``hits``
+    lists, and ``history`` a list. Every history entry must be a
+    five-element list whose entries are a non-bool int >= 0, a non-bool
+    int >= 0, a ``bool``, a ``bool`` and a checkpoint dict in that
+    order; the checkpoint must have exactly the keys ``from_cursor``,
+    ``to_cursor``, ``next_cursor``, ``old_done``, ``done``, ``delta``
+    and ``remaining`` whose seven values are non-bool ints >= 0. The
+    ``summary`` must be a six-element list of non-bool ints >= 0. Any
+    missing or extra key, wrong type, malformed structure, negative
+    value or non-finite/non-int scalar raises ``ValueError`` (or
+    ``TypeError`` when the offending scalar itself carries the wrong
+    type, mirroring :func:`robust_policy_action_restore`). Each item is
+    also checked for internal statistical consistency against its own
+    ``summary``, checkpoint values and history; any mismatch raises
+    ``ValueError``.
+
+    Consecutive segments must chain: when a later segment has a
+    non-empty history, its first checkpoint's ``from_cursor`` and
+    ``old_done`` must equal the previous segment's ``state[0]`` and
+    ``state[1]``; when the history is empty, its ``state`` must equal
+    the previous segment's ``state``. Any mismatch raises
+    ``RuntimeError``.
+
+    Histories are flattened in segment order; entries are renumbered
+    with a global 0-based index while keeping the segment index and the
+    original local index. A global ``retry`` is true for an entry when
+    the previous entry (in the flattened order) has ``failed`` true and
+    the current entry satisfies ``completed + int(failed) > 0``; the
+    rule applies across segment boundaries. ``retry_chains`` lists the
+    maximal connected runs of adjacent retry edges, each as
+    ``[first global index, last global index, list of the edge global
+    indices]``.
+
+    Returns a dict whose keys in order are ``state``, ``history``,
+    ``retry_chains``, ``pending``, ``hits`` and ``summary``:
+    ``state``, ``pending`` and ``hits`` recursively copy the last
+    segment's same-named values; each history entry is
+    ``[global index, segment index, local index, completed, failed,
+    retry, copy of the checkpoint]``; and ``summary`` is
+    ``[segment count, total attempt count, sum of completed, failed
+    count, retry count, last done, last remaining]``. Every container
+    is JSON-compatible, ``None`` is preserved, no value is rounded and
+    the inputs are never modified.
+    """
+    if not isinstance(audits, (list, tuple)):
+        raise TypeError(
+            "audits must be a list or tuple, got "
+            f"{type(audits).__name__}"
+        )
+    if len(audits) == 0:
+        raise ValueError("audits must not be empty")
+
+    audit_keys = ("state", "history", "pending", "hits", "summary")
+    checkpoint_keys = (
+        "from_cursor",
+        "to_cursor",
+        "next_cursor",
+        "old_done",
+        "done",
+        "delta",
+        "remaining",
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    def _non_bool_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    parsed: list[dict] = []
+    for segment, audit in enumerate(audits):
+        prefix = f"audits[{segment}]"
+        if not isinstance(audit, dict):
+            raise TypeError(
+                f"{prefix} must be a dict, got {type(audit).__name__}"
+            )
+        if set(audit.keys()) != set(audit_keys):
+            raise ValueError(
+                f"{prefix} must be a dict with keys {list(audit_keys)!r}, "
+                f"got keys {list(audit)!r}"
+            )
+
+        state = audit["state"]
+        if not isinstance(state, list) or len(state) != 3:
+            raise ValueError(
+                f"{prefix}['state'] must be a 3-item list, got {state!r}"
+            )
+        for pos, value in enumerate(state):
+            if not _non_bool_int(value):
+                raise ValueError(
+                    f"{prefix}['state'][{pos}] must be a non-bool int, got "
+                    f"{type(value).__name__}"
+                )
+            if value < 0:
+                raise ValueError(
+                    f"{prefix}['state'][{pos}] must be >= 0, got {value}"
+                )
+
+        for list_name in ("pending", "hits"):
+            if not isinstance(audit[list_name], list):
+                raise ValueError(
+                    f"{prefix}[{list_name!r}] must be a list, got "
+                    f"{type(audit[list_name]).__name__}"
+                )
+
+        history = audit["history"]
+        if not isinstance(history, list):
+            raise ValueError(
+                f"{prefix}['history'] must be a list, got "
+                f"{type(history).__name__}"
+            )
+
+        entries: list[dict] = []
+        for local, raw_entry in enumerate(history):
+            entry_prefix = f"{prefix}['history'][{local}]"
+            if not isinstance(raw_entry, list) or len(raw_entry) != 5:
+                raise ValueError(
+                    f"{entry_prefix} must be a 5-item list, got "
+                    f"{raw_entry!r}"
+                )
+            local_index, completed, failed, stored_retry, checkpoint = (
+                raw_entry
+            )
+            if not _non_bool_int(local_index):
+                raise ValueError(
+                    f"{entry_prefix}[0] must be a non-bool int, got "
+                    f"{type(local_index).__name__}"
+                )
+            if local_index != local:
+                raise ValueError(
+                    f"{entry_prefix}[0] must be the local index {local}, "
+                    f"got {local_index}"
+                )
+            if not _non_bool_int(completed):
+                raise ValueError(
+                    f"{entry_prefix}[1] must be a non-bool int, got "
+                    f"{type(completed).__name__}"
+                )
+            if completed < 0:
+                raise ValueError(
+                    f"{entry_prefix}[1] must be >= 0, got {completed}"
+                )
+            if not isinstance(failed, bool):
+                raise ValueError(
+                    f"{entry_prefix}[2] must be a bool, got "
+                    f"{type(failed).__name__}"
+                )
+            if not isinstance(stored_retry, bool):
+                raise ValueError(
+                    f"{entry_prefix}[3] must be a bool, got "
+                    f"{type(stored_retry).__name__}"
+                )
+            if not isinstance(checkpoint, dict) or set(
+                checkpoint.keys()
+            ) != set(checkpoint_keys):
+                raise ValueError(
+                    f"{entry_prefix}[4] must be a checkpoint dict with "
+                    f"keys {list(checkpoint_keys)!r}, got "
+                    f"{type(checkpoint).__name__}"
+                )
+
+            numbers: dict[str, int] = {}
+            for key in checkpoint_keys:
+                value = checkpoint[key]
+                if not _non_bool_int(value):
+                    raise ValueError(
+                        f"{entry_prefix}[4][{key!r}] must be a non-bool "
+                        f"int, got {type(value).__name__}"
+                    )
+                if value < 0:
+                    raise ValueError(
+                        f"{entry_prefix}[4][{key!r}] must be >= 0, got "
+                        f"{value}"
+                    )
+                numbers[key] = value
+
+            from_cursor = numbers["from_cursor"]
+            to_cursor = numbers["to_cursor"]
+            if numbers["next_cursor"] != to_cursor:
+                raise ValueError(
+                    f"{entry_prefix}[4]['next_cursor'] must equal "
+                    f"'to_cursor' ({to_cursor}), got "
+                    f"{numbers['next_cursor']}"
+                )
+            if numbers["delta"] != numbers["done"] - numbers["old_done"]:
+                raise ValueError(
+                    f"{entry_prefix}[4]['delta'] must equal done - "
+                    f"old_done ({numbers['done'] - numbers['old_done']}), "
+                    f"got {numbers['delta']}"
+                )
+            if numbers["remaining"] < 0:
+                raise ValueError(
+                    f"{entry_prefix}[4]['remaining'] must be >= 0, got "
+                    f"{numbers['remaining']}"
+                )
+            if to_cursor < from_cursor:
+                raise ValueError(
+                    f"{entry_prefix}[4] cursor must not move backwards: "
+                    f"from_cursor={from_cursor}, to_cursor={to_cursor}"
+                )
+
+            expected_retry = (
+                local > 0
+                and bool(history[local - 1][2])
+                and completed + int(failed) > 0
+            )
+            if stored_retry != expected_retry:
+                raise ValueError(
+                    f"{entry_prefix}[3] retry flag is {stored_retry}, "
+                    f"expected {expected_retry}"
+                )
+
+            entries.append(
+                {
+                    "completed": completed,
+                    "failed": failed,
+                    "retry": stored_retry,
+                    "checkpoint": numbers,
+                }
+            )
+
+        # Checkpoint chaining inside the segment mirrors
+        # robust_policy_action_restore's RuntimeError checks but, since
+        # only the audit dict is available here, a broken chain is a
+        # structural defect of the item and hence a ValueError. The
+        # remaining transition (commit computes ``nr = r - nd + d``) is
+        # checked the same way for every pair of adjacent checkpoints.
+        prev_remaining: int | None = None
+        for local, entry in enumerate(entries):
+            checkpoint = entry["checkpoint"]
+            if local == 0:
+                prev_to_cursor = checkpoint["from_cursor"]
+                prev_done = checkpoint["old_done"]
+            if checkpoint["from_cursor"] != prev_to_cursor:
+                raise ValueError(
+                    f"{prefix}['history'][{local}][4]['from_cursor'] is "
+                    f"{checkpoint['from_cursor']}, expected "
+                    f"{prev_to_cursor}"
+                )
+            if checkpoint["old_done"] != prev_done:
+                raise ValueError(
+                    f"{prefix}['history'][{local}][4]['old_done'] is "
+                    f"{checkpoint['old_done']}, expected {prev_done}"
+                )
+            if prev_remaining is not None:
+                expected_remaining = (
+                    prev_remaining - checkpoint["done"]
+                    + checkpoint["old_done"]
+                )
+                if checkpoint["remaining"] != expected_remaining:
+                    raise ValueError(
+                        f"{prefix}['history'][{local}][4]['remaining'] is "
+                        f"{checkpoint['remaining']}, expected "
+                        f"{expected_remaining}"
+                    )
+            prev_to_cursor = checkpoint["to_cursor"]
+            prev_done = checkpoint["done"]
+            prev_remaining = checkpoint["remaining"]
+
+        summary = audit["summary"]
+        if not isinstance(summary, list) or len(summary) != 6:
+            raise ValueError(
+                f"{prefix}['summary'] must be a 6-item list, got "
+                f"{summary!r}"
+            )
+        for pos, value in enumerate(summary):
+            if not _non_bool_int(value):
+                raise ValueError(
+                    f"{prefix}['summary'][{pos}] must be a non-bool int, "
+                    f"got {type(value).__name__}"
+                )
+            if value < 0:
+                raise ValueError(
+                    f"{prefix}['summary'][{pos}] must be >= 0, got {value}"
+                )
+
+        attempt_count = len(entries)
+        sum_completed = sum(entry["completed"] for entry in entries)
+        failed_count = sum(int(entry["failed"]) for entry in entries)
+        retry_count = sum(int(entry["retry"]) for entry in entries)
+        expected_summary = [
+            attempt_count,
+            sum_completed,
+            failed_count,
+            retry_count,
+            state[1],
+            state[2],
+        ]
+        if summary != expected_summary:
+            raise ValueError(
+                f"{prefix}['summary'] is {summary!r}, expected "
+                f"{expected_summary!r}"
+            )
+        if entries:
+            last_checkpoint = entries[-1]["checkpoint"]
+            if state[0] != last_checkpoint["next_cursor"]:
+                raise ValueError(
+                    f"{prefix}['state'][0] is {state[0]}, expected last "
+                    f"next_cursor {last_checkpoint['next_cursor']}"
+                )
+            if state[1] != last_checkpoint["done"]:
+                raise ValueError(
+                    f"{prefix}['state'][1] is {state[1]}, expected last "
+                    f"done {last_checkpoint['done']}"
+                )
+            if state[2] != last_checkpoint["remaining"]:
+                raise ValueError(
+                    f"{prefix}['state'][2] is {state[2]}, expected last "
+                    f"remaining {last_checkpoint['remaining']}"
+                )
+
+        parsed.append(
+            {
+                "state": state,
+                "entries": entries,
+                "pending": audit["pending"],
+                "hits": audit["hits"],
+            }
+        )
+
+    for segment in range(1, len(parsed)):
+        previous = parsed[segment - 1]
+        current = parsed[segment]
+        prev_state = previous["state"]
+        if current["entries"]:
+            first_checkpoint = current["entries"][0]["checkpoint"]
+            if first_checkpoint["from_cursor"] != prev_state[0]:
+                raise RuntimeError(
+                    f"audits[{segment}] first checkpoint from_cursor is "
+                    f"{first_checkpoint['from_cursor']}, expected previous "
+                    f"state cursor {prev_state[0]}"
+                )
+            if first_checkpoint["old_done"] != prev_state[1]:
+                raise RuntimeError(
+                    f"audits[{segment}] first checkpoint old_done is "
+                    f"{first_checkpoint['old_done']}, expected previous "
+                    f"state done {prev_state[1]}"
+                )
+        elif current["state"] != prev_state:
+            raise RuntimeError(
+                f"audits[{segment}] state {current['state']!r} does not "
+                f"match the previous segment's state {prev_state!r}"
+            )
+
+    flat_history: list[list] = []
+    global_index = 0
+    for segment, data in enumerate(parsed):
+        for local, entry in enumerate(data["entries"]):
+            retry = (
+                global_index > 0
+                and flat_history[global_index - 1][4] is True
+                and entry["completed"] + int(entry["failed"]) > 0
+            )
+            flat_history.append(
+                [
+                    global_index,
+                    segment,
+                    local,
+                    entry["completed"],
+                    entry["failed"],
+                    retry,
+                    _copy(entry["checkpoint"]),
+                ]
+            )
+            global_index += 1
+
+    retry_indices = [
+        entry[0] for entry in flat_history if entry[5]
+    ]
+    retry_chains: list[list] = []
+    for index in retry_indices:
+        if retry_chains and index == retry_chains[-1][1] + 1:
+            retry_chains[-1][1] = index
+            retry_chains[-1][2].append(index)
+        else:
+            retry_chains.append([index, index, [index]])
+
+    total_attempts = len(flat_history)
+    total_completed = sum(entry[3] for entry in flat_history)
+    total_failed = sum(int(entry[4]) for entry in flat_history)
+    total_retries = len(retry_indices)
+    last_segment = parsed[-1]
+    last_state = last_segment["state"]
+
+    return {
+        "state": _copy(last_state),
+        "history": flat_history,
+        "retry_chains": retry_chains,
+        "pending": _copy(last_segment["pending"]),
+        "hits": _copy(last_segment["hits"]),
+        "summary": [
+            len(parsed),
+            total_attempts,
+            total_completed,
+            total_failed,
+            total_retries,
+            last_state[1],
+            last_state[2],
+        ],
+    }
+
+
 def receptor_level_quantile(
     H: list[list[float]] | tuple[tuple[float, ...], ...],
     W: list[list[float]] | tuple[tuple[float, ...], ...],
