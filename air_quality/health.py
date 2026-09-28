@@ -72,6 +72,7 @@ __all__ = [
     "risk_probability",
     "risk_share",
     "robust_policy_action_batches",
+    "robust_policy_action_progress",
     "robust_policy_actions",
     "robust_policy_change_summary",
     "robust_policy_grid",
@@ -10338,6 +10339,138 @@ def robust_policy_action_batches(
         "z": _copy(actions["z"]),
         "capacity": capacity,
         "batches": batches,
+    }
+
+
+def robust_policy_action_progress(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+    capacity: int = 10,
+    rank_threshold: float = 0.0,
+    level_threshold: float = 0.0,
+) -> dict:
+    """Cumulative rank/level progress of the batched action queue.
+
+    Every parameter except ``rank_threshold`` and ``level_threshold``
+    shares the contract of :func:`robust_policy_action_batches` (every
+    ``TypeError`` and ``ValueError`` is inherited verbatim; exceptions
+    propagate unchanged). :func:`robust_policy_action_batches` is called
+    exactly once to obtain ``A``. Each of ``rank_threshold`` and
+    ``level_threshold`` must be a non-bool finite int or float >= 0; a
+    wrong type raises ``TypeError`` and a non-finite or negative value
+    raises ``ValueError``.
+
+    Let ``Q`` be the total number of actions. For each batch of
+    ``A["batches"]`` (in order), with ``e = batch["range"][1]`` and
+    ``[CR, CL] = batch["cumulative"]``, ``R`` and ``P`` are the 0-based
+    ranks (entry 0) of the batch's ``"region"`` and ``"pair"`` actions
+    respectively, each in batch order. The progress entry is
+    ``[id, e, CR, CL, CR >= rank_threshold,
+    CL >= level_threshold, Q - e, R, P]``. ``fr`` and ``fl`` are the
+    batch ids of the first entries whose rank and level flags are true,
+    or ``None`` when no flag is.
+
+    Returns a dict whose keys in order are ``budgets``, ``z``,
+    ``capacity``, ``progress`` and ``summary``: the first three values
+    recursively copy the same-named values of ``A``, and ``summary`` is
+    ``[Q, number of batches, last batch CR, last batch CL, fr, fl]``;
+    for an empty queue the last-batch cumulative values are ``0.0``.
+    Every container is JSON-compatible, ``None`` is preserved and no
+    value is rounded.
+    """
+    if not _is_number(rank_threshold):
+        raise TypeError(
+            "rank_threshold must be an int or float, got "
+            f"{type(rank_threshold).__name__}"
+        )
+    rank_limit = float(rank_threshold)
+    _check_finite("rank_threshold", rank_limit)
+    if rank_limit < 0:
+        raise ValueError(f"rank_threshold must be >= 0, got {rank_limit!r}")
+
+    if not _is_number(level_threshold):
+        raise TypeError(
+            "level_threshold must be an int or float, got "
+            f"{type(level_threshold).__name__}"
+        )
+    level_limit = float(level_threshold)
+    _check_finite("level_threshold", level_limit)
+    if level_limit < 0:
+        raise ValueError(f"level_threshold must be >= 0, got {level_limit!r}")
+
+    batched = robust_policy_action_batches(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs, capacity,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    batches = batched["batches"]
+    total_actions = sum(batch["range"][1] - batch["range"][0] for batch in batches)
+
+    progress: list[list] = []
+    first_rank: int | None = None
+    first_level: int | None = None
+    for batch in batches:
+        batch_id = batch["id"]
+        end = batch["range"][1]
+        cumulative_rank, cumulative_level = batch["cumulative"]
+        region_ranks = [
+            action[0] for action in batch["items"] if action[1] == "region"
+        ]
+        pair_ranks = [
+            action[0] for action in batch["items"] if action[1] == "pair"
+        ]
+        rank_done = cumulative_rank >= rank_limit
+        level_done = cumulative_level >= level_limit
+        if rank_done and first_rank is None:
+            first_rank = batch_id
+        if level_done and first_level is None:
+            first_level = batch_id
+        progress.append(
+            [
+                batch_id,
+                end,
+                cumulative_rank,
+                cumulative_level,
+                rank_done,
+                level_done,
+                total_actions - end,
+                region_ranks,
+                pair_ranks,
+            ]
+        )
+
+    if batches:
+        last_rank = batches[-1]["cumulative"][0]
+        last_level = batches[-1]["cumulative"][1]
+    else:
+        last_rank = 0.0
+        last_level = 0.0
+
+    return {
+        "budgets": _copy(batched["budgets"]),
+        "z": _copy(batched["z"]),
+        "capacity": batched["capacity"],
+        "progress": progress,
+        "summary": [
+            total_actions,
+            len(batches),
+            last_rank,
+            last_level,
+            first_rank,
+            first_level,
+        ],
     }
 
 
