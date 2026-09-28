@@ -71,6 +71,7 @@ __all__ = [
     "risk_interval",
     "risk_probability",
     "risk_share",
+    "robust_policy_actions",
     "robust_policy_change_summary",
     "robust_policy_grid",
     "robust_policy_grid_regions",
@@ -81,6 +82,7 @@ __all__ = [
     "robust_policy_region_flow",
     "robust_policy_report",
     "robust_policy_sensitivity",
+    "robust_policy_summary",
     "sensitivity",
 ]
 
@@ -10148,6 +10150,95 @@ def robust_policy_priority(
         "z": _copy(summary["z"]),
         "regions": regions,
         "pairs": pairs,
+    }
+
+
+def robust_policy_actions(
+    H: list[list[float]] | tuple[tuple[float, ...], ...],
+    W: list[list[float]] | tuple[tuple[float, ...], ...],
+    thresholds: list[float] | tuple[float, ...],
+    quantiles: list[float] | tuple[float, ...],
+    policies: list | tuple,
+    options: list | tuple,
+    budgets: list[float] | tuple[float, ...],
+    weight_sets: list[list[float]] | tuple[tuple[float, ...], ...],
+    zs: list[float] | tuple[float, ...],
+) -> dict:
+    """Conflict-priority action queue over regions and region pairs.
+
+    Every parameter shares the contract of :func:`robust_policy_priority`
+    (every ``TypeError`` and ``ValueError`` is inherited verbatim;
+    exceptions propagate unchanged). :func:`robust_policy_priority` is
+    called exactly once to obtain ``P``.
+
+    Let ``BR = [P["budgets"][0], P["budgets"][-1]]`` and
+    ``ZR = [P["z"][0], P["z"][-1]]``. Each
+    ``[r, B, T, RI, LI, n, D]`` entry of ``P["regions"]`` becomes, at
+    its 0-based rank ``i`` in ``P["regions"]`` order,
+    ``[i, "region", r, BR, ZR, B, T, RI, LI, n, D]``. Each
+    ``[a, b, C, RI, LI, BA, ZA]`` entry of ``P["pairs"]`` becomes, at
+    its 0-based rank ``i`` in ``P["pairs"]`` order,
+    ``[i, "pair", [a, b], BR, ZR, C, RI, LI,
+    [["budget", BA], ["z", ZA]]]``.
+
+    Returns a dict whose keys in order are ``budgets``, ``z`` and
+    ``queue``: the first two are recursive list copies of the
+    same-named entries of ``P``, and ``queue`` lists the region actions
+    first and then the pair actions, each group keeping ``P``'s
+    priority order. Every list is recursively copied; all containers
+    are JSON-compatible, ``None`` is preserved and no value is rounded.
+    """
+    priority = robust_policy_priority(
+        H, W, thresholds, quantiles, policies, options,
+        budgets, weight_sets, zs,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    budget_bounds = [priority["budgets"][0], priority["budgets"][-1]]
+    z_bounds = [priority["z"][0], priority["z"][-1]]
+
+    queue: list[list] = []
+    for i, entry in enumerate(priority["regions"]):
+        region_id, counts, total, rank_total, level_total, n_details, details = entry
+        queue.append(
+            [
+                i,
+                "region",
+                region_id,
+                _copy(budget_bounds),
+                _copy(z_bounds),
+                _copy(counts),
+                total,
+                rank_total,
+                level_total,
+                n_details,
+                _copy(details),
+            ]
+        )
+    for i, entry in enumerate(priority["pairs"]):
+        a, b, count, rank_total, level_total, budget_list, z_list = entry
+        queue.append(
+            [
+                i,
+                "pair",
+                [a, b],
+                _copy(budget_bounds),
+                _copy(z_bounds),
+                count,
+                rank_total,
+                level_total,
+                [["budget", _copy(budget_list)], ["z", _copy(z_list)]],
+            ]
+        )
+
+    return {
+        "budgets": _copy(priority["budgets"]),
+        "z": _copy(priority["z"]),
+        "queue": queue,
     }
 
 
