@@ -14,6 +14,7 @@ __all__ = [
     "assess",
     "audit_delta",
     "audit_reconcile",
+    "audit_trend_batches",
     "audit_trend_grid",
     "audit_trend_report",
     "audit_trend_summary",
@@ -12952,6 +12953,110 @@ def audit_trend_report(
         "settings": _copy(summary["settings"]),
         "events": events,
         "configs": configs,
+        "overview": overview,
+    }
+
+
+def audit_trend_batches(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    capacity: int = 10,
+) -> dict:
+    """Per-setting tallies of trend events split into fixed-size batches.
+
+    ``snapshots``, ``sizes`` and ``settings`` share the exact contract
+    of :func:`audit_trend_report` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). ``capacity`` must be a non-bool int >= 1; a wrong type
+    raises ``TypeError`` and a value below 1 raises ``ValueError``.
+
+    :func:`audit_trend_report` is called exactly once to obtain ``R``;
+    write ``E = R["events"]`` and ``P = len(settings)``. ``E`` is
+    sliced in its event order, ``capacity`` events per batch (the last
+    batch may be shorter), each batch covering the half-open interval
+    ``[beg, end)``. Within a batch ``D`` counts, in the order ``up``,
+    ``down``, ``shift``, the event directions found at index 7 of each
+    event of ``R``.
+
+    For each ``p = 0..P-1``, ``I`` is the batch's events whose index-
+    negative-one entry (the touched setting columns) contains ``p``.
+    When ``I`` is empty, ``peaks[p]`` is ``None`` and ``changes[p]`` is
+    ``0``; otherwise ``peaks[p]`` is the maximum of every event's
+    before level (index 4, entry 0) and after level (index 5, entry 0),
+    and ``changes[p]`` sums each event's
+    ``event[5][0] - event[4][0]`` over ``I``. Each batch is stored as
+    ``[beg, end, D, peaks, changes]``.
+
+    ``overview`` is ``[len(E), batch count, sum of D over the batches
+    term by term, sum of changes over the batches term by term]``; when
+    ``E`` is empty ``batches`` is empty and the last two overview
+    vectors are ``[0, 0, 0]`` and ``P`` zeros.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``capacity``, ``batches`` and ``overview``; the first two values
+    are copies of the same-named values of ``R``. Every container is
+    recursively copied and JSON-compatible (``None`` values kept,
+    numbers never rounded); the inputs are never modified.
+    """
+    if not isinstance(capacity, int) or isinstance(capacity, bool):
+        raise TypeError(
+            f"capacity must be an int, got {type(capacity).__name__}"
+        )
+    if capacity < 1:
+        raise ValueError(f"capacity must be >= 1, got {capacity}")
+
+    report = audit_trend_report(snapshots, sizes, settings)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    source_events = report["events"]
+    p_count = len(settings)
+
+    direction_index = {"up": 0, "down": 1, "shift": 2}
+
+    batches: list = []
+    direction_totals = [0, 0, 0]
+    change_totals = [0] * p_count
+    for beg in range(0, len(source_events), capacity):
+        end = min(beg + capacity, len(source_events))
+        direction_counts = [0, 0, 0]
+        peaks: list = [None] * p_count
+        changes = [0] * p_count
+        for event in source_events[beg:end]:
+            direction_counts[direction_index[event[7]]] += 1
+            before_level = event[4][0]
+            after_level = event[5][0]
+            level = (
+                before_level if before_level > after_level else after_level
+            )
+            for p in event[-1]:
+                if peaks[p] is None or level > peaks[p]:
+                    peaks[p] = level
+                changes[p] += after_level - before_level
+        for k in range(3):
+            direction_totals[k] += direction_counts[k]
+        for p in range(p_count):
+            change_totals[p] += changes[p]
+        batches.append([beg, end, direction_counts, peaks, changes])
+
+    overview = [
+        len(source_events),
+        len(batches),
+        direction_totals,
+        change_totals,
+    ]
+
+    return {
+        "sizes": _copy(report["sizes"]),
+        "settings": _copy(report["settings"]),
+        "capacity": capacity,
+        "batches": batches,
         "overview": overview,
     }
 
