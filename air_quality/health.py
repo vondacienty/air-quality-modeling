@@ -14,6 +14,7 @@ __all__ = [
     "assess",
     "audit_delta",
     "audit_reconcile",
+    "audit_trend_batch_alerts",
     "audit_trend_batches",
     "audit_trend_grid",
     "audit_trend_report",
@@ -13056,6 +13057,119 @@ def audit_trend_batches(
             direction_totals,
             changes_totals,
         ],
+    }
+
+
+def audit_trend_batch_alerts(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    capacity: int = 10,
+    threshold: int = 1,
+    minimum: int = 1,
+) -> dict:
+    """Maximal runs of per-setting active batches from the batch audit.
+
+    ``snapshots``, ``sizes``, ``settings`` and ``capacity`` share the
+    exact contract of :func:`audit_trend_batches` (every ``TypeError``
+    and ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). ``threshold`` and ``minimum`` must each be a non-bool
+    int >= 1; a wrong type raises ``TypeError`` and a value below 1
+    raises ``ValueError``.
+
+    :func:`audit_trend_batches` is called exactly once to obtain ``A``.
+    For each configuration ``p`` (in ascending order), the batches of
+    ``A["batches"]`` are scanned by batch index. A batch is active for
+    ``p`` when ``abs(changes[p]) >= threshold``. The active batches are
+    compressed into maximal contiguous segments and only segments whose
+    length is at least ``minimum`` are kept. Each segment is
+    ``[p, first_batch, last_batch, length, net, peak]``: ``net`` sums
+    the segment's ``changes[p]`` with :func:`math.fsum` and ``peak`` is
+    the maximum of the segment's ``peaks[p]`` values. Segments are
+    ordered by ``(p, first_batch)``.
+
+    ``priority`` lists the configurations that have at least one
+    segment, ordered by the :func:`math.fsum` of each configuration's
+    per-segment ``abs(net)`` (descending), then by the number of
+    batches covered by its segments (descending), then by ``p``
+    (ascending).
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``capacity``, ``threshold``, ``minimum``, ``runs`` and ``priority``;
+    the first three values copy the same-named values of ``A``. When no
+    segment qualifies, ``runs`` and ``priority`` are both empty. Every
+    container is recursively copied and JSON-compatible
+    (``None`` values kept, numbers never rounded); the inputs are never
+    modified.
+    """
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        raise TypeError(
+            "threshold must be a non-bool int, got "
+            f"{type(threshold).__name__}"
+        )
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            "minimum must be a non-bool int, got "
+            f"{type(minimum).__name__}"
+        )
+    if threshold < 1:
+        raise ValueError(f"threshold must be >= 1, got {threshold}")
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    batches_result = audit_trend_batches(snapshots, sizes, settings, capacity)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    batches = batches_result["batches"]
+    p_count = len(settings)
+
+    runs: list = []
+    for p in range(p_count):
+        index = 0
+        total = len(batches)
+        while index < total:
+            if abs(batches[index][4][p]) < threshold:
+                index += 1
+                continue
+            last = index
+            while last + 1 < total and abs(
+                batches[last + 1][4][p]
+            ) >= threshold:
+                last += 1
+            length = last - index + 1
+            if length >= minimum:
+                net = math.fsum(
+                    batches[b][4][p] for b in range(index, last + 1)
+                )
+                peak = max(batches[b][3][p] for b in range(index, last + 1))
+                runs.append([p, index, last, length, net, peak])
+            index = last + 1
+
+    covered: dict[int, int] = {}
+    net_values: dict[int, list] = {}
+    for run in runs:
+        p = run[0]
+        covered[p] = covered.get(p, 0) + run[3]
+        net_values.setdefault(p, []).append(abs(run[4]))
+    priority = sorted(
+        covered,
+        key=lambda p: (-math.fsum(net_values[p]), -covered[p], p),
+    )
+
+    return {
+        "sizes": _copy(batches_result["sizes"]),
+        "settings": _copy(batches_result["settings"]),
+        "capacity": batches_result["capacity"],
+        "threshold": threshold,
+        "minimum": minimum,
+        "runs": runs,
+        "priority": priority,
     }
 
 
