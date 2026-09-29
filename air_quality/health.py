@@ -9,6 +9,7 @@ from .gaussian import _check_finite, _is_number
 
 __all__ = [
     "alert_region_plan",
+    "alert_region_progress",
     "aggregate",
     "aggregate_correlated",
     "any_receptor_probability",
@@ -13658,6 +13659,187 @@ def alert_region_plan(
         "actions": actions,
         "batches": batches,
         "mapping": mapping,
+    }
+
+
+def alert_region_progress(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    thresholds: list | tuple,
+    minimums: list | tuple,
+    done: list | tuple,
+    failed: list | tuple,
+    capacity: int = 10,
+    batch: int = 10,
+) -> dict:
+    """Execution progress over the layered, batched alert-region plan.
+
+    Every parameter except ``done`` and ``failed`` shares the exact
+    contract of :func:`alert_region_plan` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`alert_region_plan` is called exactly once to
+    obtain the plan ``P``.
+
+    ``done`` and ``failed`` must each be a list or tuple of non-bool
+    int region ids; empty sequences are allowed. The ids must be valid
+    region ids of ``P``, must not repeat within one sequence and must
+    not appear in both sequences. A wrong container or element type
+    raises ``TypeError``; a duplicate, out-of-range or cross-listed id
+    raises ``ValueError``.
+
+    In the order of ``P["actions"]``, let ``D``, ``F`` and ``U`` be the
+    regions listed in ``done``, ``failed`` and neither. ``state`` is
+    ``[D, F, U]``.
+
+    For each batch of ``P`` (in batch order) the output is
+    ``[id, D_b, F_b, U_b, totals]`` with the batch's regions grouped by
+    status in slice order and ``totals`` the cumulative
+    ``[completed_count, member_count, score]`` up to and including the
+    batch, counting only ``D`` regions; member count and score come from
+    action indices 3 and 2 and score is accumulated with
+    :func:`math.fsum`.
+
+    ``layers`` lists, in ascending layer order, one
+    ``[layer, D_l, F_l, U_l]`` per layer, with the layer's regions
+    grouped in action order. ``configs`` lists, in the order of
+    ``P["mapping"]``, one ``[p, D_p, F_p, U_p]`` per configuration,
+    with its regions grouped in the same order as the mapping entry.
+
+    Returns a dict whose keys in order are ``thresholds``,
+    ``minimums``, ``state``, ``batches``, ``layers`` and ``configs``;
+    the first two values are copies of the same-named entries of ``P``.
+    Every container is recursively copied and JSON-compatible
+    (``None`` values kept, numbers never rounded); the inputs are never
+    modified.
+    """
+    for name, values in (("done", done), ("failed", failed)):
+        if not isinstance(values, (list, tuple)):
+            raise TypeError(
+                f"{name} must be a list or tuple, got {type(values).__name__}"
+            )
+        for index, item in enumerate(values):
+            if not isinstance(item, int) or isinstance(item, bool):
+                raise TypeError(
+                    f"{name}[{index}] must be a non-bool int region id, "
+                    f"got {type(item).__name__}"
+                )
+
+    plan = alert_region_plan(
+        snapshots,
+        sizes,
+        settings,
+        thresholds,
+        minimums,
+        capacity,
+        batch,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    actions = plan["actions"]
+    region_count = len(actions)
+
+    done_ids: list[int] = []
+    failed_ids: list[int] = []
+    for name, values, target in (
+        ("done", done, done_ids),
+        ("failed", failed, failed_ids),
+    ):
+        seen: set[int] = set()
+        for index, item in enumerate(values):
+            if item in seen:
+                raise ValueError(
+                    f"{name}[{index}] duplicates region id {item}"
+                )
+            if item < 0 or item >= region_count:
+                raise ValueError(
+                    f"{name}[{index}] region id {item} out of range "
+                    f"0..{region_count - 1}"
+                )
+            seen.add(item)
+            target.append(item)
+    failed_set = set(failed_ids)
+    for region_id in done_ids:
+        if region_id in failed_set:
+            raise ValueError(
+                f"region id {region_id} appears in both done and failed"
+            )
+
+    done_set = set(done_ids)
+
+    def _status(region_id: int) -> int:
+        if region_id in done_set:
+            return 0
+        if region_id in failed_set:
+            return 1
+        return 2
+
+    state: list[list[int]] = [[], [], []]
+    layers_by_layer: dict[int, list[list[int]]] = {}
+    for action in actions:
+        region_id = action[0]
+        layer = action[1]
+        status = _status(region_id)
+        state[status].append(region_id)
+        if layer not in layers_by_layer:
+            layers_by_layer[layer] = [[], [], []]
+        layers_by_layer[layer][status].append(region_id)
+
+    action_by_id = {action[0]: action for action in actions}
+    batches: list = []
+    cumulative_completed = 0
+    cumulative_members = 0
+    score_terms: list = []
+    for plan_batch in plan["batches"]:
+        batch_id = plan_batch[0]
+        grouped: list[list[int]] = [[], [], []]
+        for region_id in plan_batch[1]:
+            status = _status(region_id)
+            grouped[status].append(region_id)
+            if status == 0:
+                cumulative_completed += 1
+                cumulative_members += action_by_id[region_id][3]
+                score_terms.append(action_by_id[region_id][2])
+        batches.append(
+            [
+                batch_id,
+                grouped[0],
+                grouped[1],
+                grouped[2],
+                [
+                    cumulative_completed,
+                    cumulative_members,
+                    math.fsum(score_terms),
+                ],
+            ]
+        )
+
+    layers = [
+        [layer, layers_by_layer[layer][0], layers_by_layer[layer][1],
+         layers_by_layer[layer][2]]
+        for layer in sorted(layers_by_layer)
+    ]
+
+    configs: list = []
+    for p, regions in plan["mapping"]:
+        grouped = [[], [], []]
+        for region_id in regions:
+            grouped[_status(region_id)].append(region_id)
+        configs.append([p, grouped[0], grouped[1], grouped[2]])
+
+    return {
+        "thresholds": _copy(plan["thresholds"]),
+        "minimums": _copy(plan["minimums"]),
+        "state": state,
+        "batches": batches,
+        "layers": layers,
+        "configs": configs,
     }
 
 
