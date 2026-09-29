@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_trend_grid",
+    "audit_trend_turns",
     "audit_window_report",
     "audit_window_trend",
     "at_least_count_probability",
@@ -12628,6 +12629,108 @@ def audit_trend_grid(
         "settings": [list(setting) for setting in setting_values],
         "warnings": warnings,
         "stability": stability,
+    }
+
+
+def audit_trend_turns(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+) -> dict:
+    """Locate warning turns across the size and setting axes.
+
+    ``snapshots``, ``sizes`` and ``settings`` share the exact contract
+    of :func:`audit_trend_grid` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged).
+
+    :func:`audit_trend_grid` is called exactly once to obtain ``G``;
+    write ``W = G["warnings"]``, ``B = len(sizes)`` and
+    ``P = len(settings)``.
+
+    ``size_changes`` scans, for each ``p`` and then ``b = 1..B-1``, the
+    adjacent size cells; whenever ``W[b-1][p] != W[b][p]`` it records
+    ``[[b-1, p], [b, p], former_copy, latter_copy, fields]``.
+    ``setting_changes`` scans, for each ``b`` and then ``p = 1..P-1``,
+    the adjacent setting cells; whenever ``W[b][p-1] != W[b][p]`` it
+    records ``[[b, p-1], [b, p], former_copy, latter_copy, fields]``.
+    In both cases ``fields`` lists, in the order ``level``,
+    ``first_bad``, ``first_good``, the names of the warning positions
+    whose values differ between the former and the latter cell.
+
+    With ``X[p] = [[W[b][p] for b in range(B)], G["stability"][p]]``,
+    ``consistency`` is the P x P matrix with
+    ``consistency[p][q] = (X[p] == X[q])``.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``size_changes``, ``setting_changes`` and ``consistency``. Every
+    container is recursively copied and JSON-compatible
+    (``None`` values kept, numbers never rounded); the inputs are never
+    modified.
+    """
+    grid = audit_trend_grid(snapshots, sizes, settings)
+
+    warnings = grid["warnings"]
+    stability = grid["stability"]
+    b_count = len(sizes)
+    p_count = len(settings)
+
+    field_names = ("level", "first_bad", "first_good")
+
+    def _changed_fields(former: list, latter: list) -> list:
+        return [
+            field_names[k]
+            for k in range(3)
+            if former[k] != latter[k]
+        ]
+
+    size_changes: list = []
+    for p in range(p_count):
+        for b in range(1, b_count):
+            former = warnings[b - 1][p]
+            latter = warnings[b][p]
+            if former != latter:
+                size_changes.append(
+                    [
+                        [b - 1, p],
+                        [b, p],
+                        list(former),
+                        list(latter),
+                        _changed_fields(former, latter),
+                    ]
+                )
+
+    setting_changes: list = []
+    for b in range(b_count):
+        for p in range(1, p_count):
+            former = warnings[b][p - 1]
+            latter = warnings[b][p]
+            if former != latter:
+                setting_changes.append(
+                    [
+                        [b, p - 1],
+                        [b, p],
+                        list(former),
+                        list(latter),
+                        _changed_fields(former, latter),
+                    ]
+                )
+
+    columns = [
+        [[warnings[b][p] for b in range(b_count)], stability[p]]
+        for p in range(p_count)
+    ]
+    consistency = [
+        [columns[p] == columns[q] for q in range(p_count)]
+        for p in range(p_count)
+    ]
+
+    return {
+        "sizes": list(grid["sizes"]),
+        "settings": [list(setting) for setting in grid["settings"]],
+        "size_changes": size_changes,
+        "setting_changes": setting_changes,
+        "consistency": consistency,
     }
 
 
