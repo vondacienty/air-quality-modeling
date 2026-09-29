@@ -8,6 +8,7 @@ from itertools import product
 from .gaussian import _check_finite, _is_number
 
 __all__ = [
+    "alert_region_advance",
     "alert_region_plan",
     "alert_region_progress",
     "alert_region_step",
@@ -13837,6 +13838,364 @@ def alert_region_progress(
     }
 
 
+def _alert_region_id_list(value: object, name: str, *, sort: bool = False) -> list:
+    """Validate a list/tuple of unique non-bool int region ids."""
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            f"{name} must be a list or tuple, got {type(value).__name__}"
+        )
+    ids: list = []
+    seen: set = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise TypeError(
+                f"{name}[{index}] must be a non-bool int, "
+                f"got {type(item).__name__}"
+            )
+        if item in seen:
+            raise ValueError(f"{name} contains duplicate region id: {item}")
+        seen.add(item)
+        ids.append(item)
+    if sort:
+        ids.sort()
+    return ids
+
+
+def _alert_region_checkpoint(item: object, where: str, universe: set) -> list:
+    """Validate one history checkpoint ``[pre, post, finish, retry]``."""
+    if not isinstance(item, (list, tuple)):
+        raise TypeError(
+            f"{where} must be a list or tuple, got {type(item).__name__}"
+        )
+    if len(item) != 4:
+        raise ValueError(
+            f"{where} must have exactly 4 items "
+            "[pre_state, post_state, finish, retry], "
+            f"got {len(item)}"
+        )
+
+    def _state(value: object, state_where: str) -> list:
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(
+                f"{state_where} must be a list or tuple, "
+                f"got {type(value).__name__}"
+            )
+        if len(value) != 3:
+            raise ValueError(
+                f"{state_where} must have exactly 3 groups [D, F, U], "
+                f"got {len(value)}"
+            )
+        groups = [
+            _alert_region_id_list(
+                value[group_index],
+                f"{state_where}[{group_index}]",
+                sort=True,
+            )
+            for group_index in range(3)
+        ]
+        group_sets = [set(group) for group in groups]
+        for left, right in ((0, 1), (0, 2), (1, 2)):
+            shared = sorted(group_sets[left] & group_sets[right])
+            if shared:
+                raise ValueError(
+                    f"{state_where} groups must be pairwise disjoint, group "
+                    f"{left} and group {right} share id(s): {shared}"
+                )
+        for group_index, ids in enumerate(groups):
+            out_of_range = sorted(
+                region_id for region_id in ids if region_id not in universe
+            )
+            if out_of_range:
+                raise ValueError(
+                    f"{state_where}[{group_index}] contains id(s) outside the "
+                    f"progress region universe: {out_of_range}"
+                )
+        covered = group_sets[0] | group_sets[1] | group_sets[2]
+        if covered != universe:
+            missing = sorted(universe - covered)
+            if missing:
+                raise ValueError(
+                    f"{state_where} does not cover the whole region universe, "
+                    f"missing id(s): {missing}"
+                )
+        return groups
+
+    pre_state = _state(item[0], f"{where}[0]")
+    post_state = _state(item[1], f"{where}[1]")
+    step_finish = _alert_region_id_list(
+        item[2], f"{where}[2] (finish)", sort=True
+    )
+    step_retry = _alert_region_id_list(
+        item[3], f"{where}[3] (retry)", sort=True
+    )
+
+    pre_sets = [set(group) for group in pre_state]
+    bad_step_finish = sorted(
+        region_id for region_id in step_finish if region_id not in pre_sets[2]
+    )
+    if bad_step_finish:
+        raise ValueError(
+            f"{where} finish id(s) must come from its pre-state U "
+            f"group: {bad_step_finish}"
+        )
+    bad_step_retry = sorted(
+        region_id for region_id in step_retry if region_id not in pre_sets[1]
+    )
+    if bad_step_retry:
+        raise ValueError(
+            f"{where} retry id(s) must come from its pre-state F "
+            f"group: {bad_step_retry}"
+        )
+    expected_post = [
+        sorted(pre_sets[0] | set(step_finish)),
+        sorted(pre_sets[1] - set(step_retry)),
+        sorted((pre_sets[2] - set(step_finish)) | set(step_retry)),
+    ]
+    if expected_post != post_state:
+        raise ValueError(
+            f"{where} post-state does not match its finish/retry transition"
+        )
+    return [pre_state, post_state, step_finish, step_retry]
+
+
+def _alert_region_progress(progress: object) -> tuple:
+    """Fully validate an :func:`alert_region_progress` result.
+
+    Returns ``(current, configs)`` where ``current`` is the
+    ascending-id ``[D, F, U]`` state and ``configs`` lists normalized
+    ``[p, D_p, F_p, U_p]`` entries. Every structural defect raises
+    ``TypeError`` (wrong container, item, group or id type) or
+    ``ValueError`` (wrong shape, duplicate, crossing or broken
+    correspondence).
+    """
+    if not isinstance(progress, dict):
+        raise TypeError(
+            f"progress must be a dict, got {type(progress).__name__}"
+        )
+    progress_keys = (
+        "thresholds",
+        "minimums",
+        "state",
+        "batches",
+        "layers",
+        "configs",
+    )
+    if set(progress.keys()) != set(progress_keys):
+        raise ValueError(
+            "progress must have exactly the keys "
+            f"{list(progress_keys)!r}, got keys {list(progress)!r}"
+        )
+
+    state = progress["state"]
+    if not isinstance(state, (list, tuple)):
+        raise TypeError(
+            "progress['state'] must be a list or tuple, got "
+            f"{type(state).__name__}"
+        )
+    if len(state) != 3:
+        raise ValueError(
+            "progress['state'] must have exactly 3 groups [D, F, U], "
+            f"got {len(state)}"
+        )
+    state_groups = [
+        _alert_region_id_list(state[k], f"progress['state'][{k}]")
+        for k in range(3)
+    ]
+    current = [sorted(group) for group in state_groups]
+    current_sets = [set(group) for group in current]
+    for left, right in ((0, 1), (0, 2), (1, 2)):
+        shared = sorted(current_sets[left] & current_sets[right])
+        if shared:
+            raise ValueError(
+                "progress['state'] groups must be pairwise disjoint, "
+                f"group {left} and group {right} share id(s): {shared}"
+            )
+    universe = current_sets[0] | current_sets[1] | current_sets[2]
+
+    batches_raw = progress["batches"]
+    if not isinstance(batches_raw, (list, tuple)):
+        raise TypeError(
+            "progress['batches'] must be a list or tuple, got "
+            f"{type(batches_raw).__name__}"
+        )
+    batch_union: list = []
+    expected_batch_id = 0
+    for batch_index, entry in enumerate(batches_raw):
+        where = f"progress['batches'][{batch_index}]"
+        if not isinstance(entry, (list, tuple)):
+            raise TypeError(
+                f"{where} must be a list or tuple, got {type(entry).__name__}"
+            )
+        if len(entry) != 5:
+            raise ValueError(
+                f"{where} must have exactly 5 items "
+                f"[id, D_b, F_b, U_b, totals], got {len(entry)}"
+            )
+        batch_id = entry[0]
+        if not isinstance(batch_id, int) or isinstance(batch_id, bool):
+            raise TypeError(
+                f"{where}[0] must be a non-bool int, "
+                f"got {type(batch_id).__name__}"
+            )
+        if batch_id != expected_batch_id:
+            raise ValueError(
+                f"{where} batch id must be {expected_batch_id}, got {batch_id}"
+            )
+        expected_batch_id += 1
+        for group_index in range(3):
+            group_where = f"{where}[{group_index + 1}]"
+            group = _alert_region_id_list(entry[group_index + 1], group_where)
+            wrong_status = sorted(
+                region_id for region_id in group
+                if region_id not in current_sets[group_index]
+            )
+            if wrong_status:
+                raise ValueError(
+                    f"{group_where} id(s) must match progress['state'] "
+                    f"group {group_index} status: {wrong_status}"
+                )
+            batch_union.extend(group)
+
+    if len(batch_union) != len(set(batch_union)) or \
+            set(batch_union) != universe:
+        if len(batch_union) != len(set(batch_union)):
+            raise ValueError(
+                "progress['batches'] groups repeat or cross region ids; each "
+                "region must appear in exactly one batch group"
+            )
+        raise ValueError(
+            "progress['batches'] groups must be an exhaustive, disjoint "
+            f"union of progress['state']; missing id(s): "
+            f"{sorted(universe - set(batch_union))}, extra id(s): "
+            f"{sorted(set(batch_union) - universe)}"
+        )
+
+    layers_raw = progress["layers"]
+    if not isinstance(layers_raw, (list, tuple)):
+        raise TypeError(
+            "progress['layers'] must be a list or tuple, got "
+            f"{type(layers_raw).__name__}"
+        )
+    layer_union: list = []
+    seen_layers: list = []
+    for layer_index, entry in enumerate(layers_raw):
+        where = f"progress['layers'][{layer_index}]"
+        if not isinstance(entry, (list, tuple)):
+            raise TypeError(
+                f"{where} must be a list or tuple, got {type(entry).__name__}"
+            )
+        if len(entry) != 4:
+            raise ValueError(
+                f"{where} must have exactly 4 items [layer, D_l, F_l, U_l], "
+                f"got {len(entry)}"
+            )
+        layer = entry[0]
+        if not isinstance(layer, int) or isinstance(layer, bool):
+            raise TypeError(
+                f"{where}[0] (layer) must be a non-bool int, "
+                f"got {type(layer).__name__}"
+            )
+        if layer in seen_layers:
+            raise ValueError(
+                f"{where} duplicates an earlier layer value: {layer}"
+            )
+        seen_layers.append(layer)
+        for group_index in range(3):
+            group_where = f"{where}[{group_index + 1}]"
+            group = _alert_region_id_list(entry[group_index + 1], group_where)
+            wrong_status = sorted(
+                region_id for region_id in group
+                if region_id not in current_sets[group_index]
+            )
+            if wrong_status:
+                raise ValueError(
+                    f"{group_where} id(s) must match progress['state'] "
+                    f"group {group_index} status: {wrong_status}"
+                )
+            layer_union.extend(group)
+    if seen_layers != sorted(seen_layers):
+        raise ValueError(
+            "progress['layers'] layer values must be in strictly "
+            "ascending order"
+        )
+    if len(layer_union) != len(set(layer_union)) or \
+            set(layer_union) != universe:
+        if len(layer_union) != len(set(layer_union)):
+            raise ValueError(
+                "progress['layers'] groups repeat or cross region ids; each "
+                "region must appear in exactly one layer group"
+            )
+        raise ValueError(
+            "progress['layers'] groups must be an exhaustive, disjoint "
+            f"union of progress['state']; missing id(s): "
+            f"{sorted(universe - set(layer_union))}, extra id(s): "
+            f"{sorted(set(layer_union) - universe)}"
+        )
+
+    configs_raw = progress["configs"]
+    if not isinstance(configs_raw, (list, tuple)):
+        raise TypeError(
+            "progress['configs'] must be a list or tuple, got "
+            f"{type(configs_raw).__name__}"
+        )
+    configs: list = []
+    seen_p: set = set()
+    for config_index, entry in enumerate(configs_raw):
+        where = f"progress['configs'][{config_index}]"
+        if not isinstance(entry, (list, tuple)):
+            raise TypeError(
+                f"{where} must be a list or tuple, got {type(entry).__name__}"
+            )
+        if len(entry) != 4:
+            raise ValueError(
+                f"{where} must have exactly 4 items [p, D_p, F_p, U_p], "
+                f"got {len(entry)}"
+            )
+        p_value = entry[0]
+        if not isinstance(p_value, int) or isinstance(p_value, bool):
+            raise TypeError(
+                f"{where}[0] (p) must be a non-bool int, "
+                f"got {type(p_value).__name__}"
+            )
+        if p_value in seen_p:
+            raise ValueError(
+                f"{where} duplicates an earlier configuration p: {p_value}"
+            )
+        seen_p.add(p_value)
+        groups: list = []
+        for group_index in range(3):
+            group_where = f"{where}[{group_index + 1}]"
+            group = _alert_region_id_list(entry[group_index + 1], group_where)
+            wrong_status = sorted(
+                region_id for region_id in group
+                if region_id not in current_sets[group_index]
+            )
+            if wrong_status:
+                raise ValueError(
+                    f"{group_where} id(s) must match progress['state'] "
+                    f"group {group_index} status: {wrong_status}"
+                )
+            groups.append(sorted(group))
+        group_sets = [set(group) for group in groups]
+        for left, right in ((0, 1), (0, 2), (1, 2)):
+            shared = sorted(group_sets[left] & group_sets[right])
+            if shared:
+                raise ValueError(
+                    f"{where} groups must be pairwise disjoint, group "
+                    f"{left} and group {right} share id(s): {shared}"
+                )
+        for group_index, group_set in enumerate(group_sets):
+            extra = sorted(group_set - universe)
+            if extra:
+                raise ValueError(
+                    f"{where}[{group_index + 1}] contains id(s) absent from "
+                    f"progress['state']: {extra}"
+                )
+        configs.append([p_value, *groups])
+
+    return current, configs
+
+
 def alert_region_step(
     progress: dict,
     finish: list | tuple,
@@ -13854,12 +14213,23 @@ def alert_region_step(
     non-bool int region ids, pairwise disjoint and together covering
     one region universe; the groups are normalized to ascending id
     order (a genuine :func:`alert_region_progress` result is accepted
-    whatever its group order). ``configs`` must be a list (or tuple)
-    of ``[p, D_p, F_p, U_p]`` items whose three groups are lists (or
-    tuples) of non-bool ints, pairwise disjoint, with every id taken
-    from ``state``. A wrong container or element type raises
-    ``TypeError``; a wrong shape, a duplicate group entry, crossing
-    groups or a config id absent from ``state`` raises ``ValueError``.
+    whatever its group order). The groups of every ``batches`` entry
+    ``[id, D_b, F_b, U_b, totals]`` and every ``layers`` entry
+    ``[layer, D_l, F_l, U_l]`` must be lists (or tuples) of non-bool
+    ints whose ids have the same ``D``/``F``/``U`` status as in
+    ``state``; the batch ids must be consecutive from 0, the layer
+    values must be unique and ascending, and all batch (or layer)
+    groups together must be an exhaustive and disjoint union of the
+    ``state`` region universe. ``configs`` must be a list (or tuple)
+    of unique-``p`` ``[p, D_p, F_p, U_p]`` items: ``p`` is a non-bool
+    int, the three groups are lists (or tuples) of non-bool ints with
+    the same status as the corresponding ``state`` group, pairwise
+    disjoint, and every id is taken from ``state``; each group
+    therefore equals the intersection of that configuration's region
+    set with the corresponding ``state`` group. A wrong container,
+    item, group or id type raises ``TypeError``; a wrong shape,
+    duplicate, crossing group, non-ascending layer order or broken
+    correspondence raises ``ValueError``.
 
     ``finish`` and ``retry`` must each be a list or tuple of unique
     non-bool int region ids; empty sequences are allowed. A wrong
@@ -13904,243 +14274,22 @@ def alert_region_step(
             return [_copy(item) for item in value]
         return value
 
-    def _normalize_group(value: object, where: str) -> list:
-        if not isinstance(value, (list, tuple)):
-            raise TypeError(
-                f"{where} must be a list or tuple, got {type(value).__name__}"
-            )
-        ids: list = []
-        seen: set[int] = set()
-        for index, item in enumerate(value):
-            if not isinstance(item, int) or isinstance(item, bool):
-                raise TypeError(
-                    f"{where}[{index}] must be a non-bool int, "
-                    f"got {type(item).__name__}"
-                )
-            if item in seen:
-                raise ValueError(
-                    f"{where} contains duplicate region id: {item}"
-                )
-            seen.add(item)
-            ids.append(item)
-        return sorted(ids)
-
-    def _normalize_id_list(value: object, name: str) -> list:
-        if not isinstance(value, (list, tuple)):
-            raise TypeError(
-                f"{name} must be a list or tuple, got {type(value).__name__}"
-            )
-        ids = []
-        seen: set[int] = set()
-        for index, item in enumerate(value):
-            if not isinstance(item, int) or isinstance(item, bool):
-                raise TypeError(
-                    f"{name}[{index}] must be a non-bool int, "
-                    f"got {type(item).__name__}"
-                )
-            if item in seen:
-                raise ValueError(
-                    f"{name} contains duplicate region id: {item}"
-                )
-            seen.add(item)
-            ids.append(item)
-        return ids
-
-    if not isinstance(progress, dict):
-        raise TypeError(
-            f"progress must be a dict, got {type(progress).__name__}"
-        )
-    progress_keys = (
-        "thresholds",
-        "minimums",
-        "state",
-        "batches",
-        "layers",
-        "configs",
-    )
-    if set(progress.keys()) != set(progress_keys):
-        raise ValueError(
-            "progress must have exactly the keys "
-            f"{list(progress_keys)!r}, got keys {list(progress)!r}"
-        )
-
-    state = progress["state"]
-    if not isinstance(state, (list, tuple)):
-        raise ValueError(
-            "progress['state'] must be a list or tuple, got "
-            f"{type(state).__name__}"
-        )
-    if len(state) != 3:
-        raise ValueError(
-            "progress['state'] must have exactly 3 groups [D, F, U], "
-            f"got {len(state)}"
-        )
-    current = [
-        _normalize_group(state[0], "progress['state'][0] (D)"),
-        _normalize_group(state[1], "progress['state'][1] (F)"),
-        _normalize_group(state[2], "progress['state'][2] (U)"),
-    ]
+    current, configs = _alert_region_progress(progress)
     current_sets = [set(group) for group in current]
-    for left, right in ((0, 1), (0, 2), (1, 2)):
-        shared = sorted(current_sets[left] & current_sets[right])
-        if shared:
-            raise ValueError(
-                "progress['state'] groups must be pairwise disjoint, "
-                f"group {left} and group {right} share id(s): {shared}"
-            )
     universe = current_sets[0] | current_sets[1] | current_sets[2]
 
-    configs_raw = progress["configs"]
-    if not isinstance(configs_raw, (list, tuple)):
-        raise ValueError(
-            "progress['configs'] must be a list or tuple, got "
-            f"{type(configs_raw).__name__}"
-        )
-    configs: list = []
-    for config_index, entry in enumerate(configs_raw):
-        if not isinstance(entry, (list, tuple)):
-            raise TypeError(
-                f"progress['configs'][{config_index}] must be a list or "
-                f"tuple, got {type(entry).__name__}"
-            )
-        if len(entry) != 4:
-            raise ValueError(
-                f"progress['configs'][{config_index}] must have exactly 4 "
-                f"items [p, D_p, F_p, U_p], got {len(entry)}"
-            )
-        p_value = entry[0]
-        if not isinstance(p_value, int) or isinstance(p_value, bool):
-            raise TypeError(
-                f"progress['configs'][{config_index}][0] (p) must be a "
-                f"non-bool int, got {type(p_value).__name__}"
-            )
-        config_groups = [
-            _normalize_group(
-                entry[group_index + 1],
-                f"progress['configs'][{config_index}][{group_index + 1}]",
-            )
-            for group_index in range(3)
-        ]
-        config_sets = [set(group) for group in config_groups]
-        for left, right in ((0, 1), (0, 2), (1, 2)):
-            shared = sorted(config_sets[left] & config_sets[right])
-            if shared:
-                raise ValueError(
-                    f"progress['configs'][{config_index}] groups must be "
-                    f"pairwise disjoint, group {left} and group {right} "
-                    f"share id(s): {shared}"
-                )
-        for group_index, ids in enumerate(config_groups):
-            out_of_range = sorted(
-                region_id for region_id in ids
-                if region_id not in universe
-            )
-            if out_of_range:
-                raise ValueError(
-                    f"progress['configs'][{config_index}][{group_index + 1}]"
-                    " contains id(s) absent from progress['state']: "
-                    f"{out_of_range}"
-                )
-        configs.append([p_value, *config_groups])
-
-    finish_ids = _normalize_id_list(finish, "finish")
-    retry_ids = _normalize_id_list(retry, "retry")
+    finish_ids = _alert_region_id_list(finish, "finish")
+    retry_ids = _alert_region_id_list(retry, "retry")
 
     if not isinstance(history, (list, tuple)):
         raise TypeError(
             f"history must be a list or tuple, got {type(history).__name__}"
         )
 
-    def _normalize_state(value: object, where: str) -> list:
-        if not isinstance(value, (list, tuple)):
-            raise TypeError(
-                f"{where} must be a list or tuple, got {type(value).__name__}"
-            )
-        if len(value) != 3:
-            raise ValueError(
-                f"{where} must have exactly 3 groups [D, F, U], "
-                f"got {len(value)}"
-            )
-        groups = [
-            _normalize_group(value[group_index], f"{where}[{group_index}]")
-            for group_index in range(3)
-        ]
-        group_sets = [set(group) for group in groups]
-        for left, right in ((0, 1), (0, 2), (1, 2)):
-            shared = sorted(group_sets[left] & group_sets[right])
-            if shared:
-                raise ValueError(
-                    f"{where} groups must be pairwise disjoint, group "
-                    f"{left} and group {right} share id(s): {shared}"
-                )
-        for group_index, ids in enumerate(groups):
-            out_of_range = sorted(region_id for region_id in ids
-                                  if region_id not in universe)
-            if out_of_range:
-                raise ValueError(
-                    f"{where}[{group_index}] contains id(s) outside the "
-                    f"progress region universe: {out_of_range}"
-                )
-        covered = group_sets[0] | group_sets[1] | group_sets[2]
-        if covered != universe:
-            missing = sorted(universe - covered)
-            if missing:
-                raise ValueError(
-                    f"{where} does not cover the whole region universe, "
-                    f"missing id(s): {missing}"
-                )
-        return groups
-
-    normalized_history: list = []
-    for history_index, item in enumerate(history):
-        where = f"history[{history_index}]"
-        if not isinstance(item, (list, tuple)):
-            raise TypeError(
-                f"{where} must be a list or tuple, got {type(item).__name__}"
-            )
-        if len(item) != 4:
-            raise ValueError(
-                f"{where} must have exactly 4 items "
-                "[pre_state, post_state, finish, retry], "
-                f"got {len(item)}"
-            )
-        pre_state = _normalize_state(item[0], f"{where}[0]")
-        post_state = _normalize_state(item[1], f"{where}[1]")
-        step_finish = _normalize_id_list(item[2], f"{where}[2] (finish)")
-        step_retry = _normalize_id_list(item[3], f"{where}[3] (retry)")
-
-        pre_sets = [set(group) for group in pre_state]
-        bad_step_finish = sorted(
-            region_id for region_id in step_finish
-            if region_id not in pre_sets[2]
-        )
-        if bad_step_finish:
-            raise ValueError(
-                f"{where} finish id(s) must come from its pre-state U "
-                f"group: {bad_step_finish}"
-            )
-        bad_step_retry = sorted(
-            region_id for region_id in step_retry
-            if region_id not in pre_sets[1]
-        )
-        if bad_step_retry:
-            raise ValueError(
-                f"{where} retry id(s) must come from its pre-state F "
-                f"group: {bad_step_retry}"
-            )
-        expected_post = [
-            sorted(pre_sets[0] | set(step_finish)),
-            sorted(pre_sets[1] - set(step_retry)),
-            sorted((pre_sets[2] - set(step_finish)) | set(step_retry)),
-        ]
-        if expected_post != post_state:
-            raise ValueError(
-                f"{where} post-state does not match its finish/retry "
-                "transition"
-            )
-        normalized_history.append(
-            [pre_state, post_state, step_finish, step_retry]
-        )
+    normalized_history = [
+        _alert_region_checkpoint(item, f"history[{history_index}]", universe)
+        for history_index, item in enumerate(history)
+    ]
 
     bad_finish = sorted(
         region_id for region_id in finish_ids
@@ -14219,6 +14368,180 @@ def alert_region_step(
         "thresholds": _copy(progress["thresholds"]),
         "minimums": _copy(progress["minimums"]),
         "checkpoint": checkpoint,
+        "history": history_out,
+        "changes": changes,
+    }
+
+
+def alert_region_advance(
+    progress: dict,
+    steps: list | tuple,
+    history: list | tuple = (),
+) -> dict:
+    """Atomically commit a sequence of finish/retry steps.
+
+    ``progress`` and ``history`` share the exact contract of
+    :func:`alert_region_step` (every ``TypeError``, ``ValueError`` and
+    ``RuntimeError`` is inherited verbatim); the history chain must end
+    at the current state of ``progress``.
+
+    ``steps`` must be a list or tuple; an empty sequence is allowed.
+    Each item must be a list or tuple of exactly two items
+    ``[finish, retry]``, each a list or tuple of unique non-bool int
+    region ids (empty lists allowed). A wrong container, item or id
+    type raises ``TypeError``; an item that is not a pair or a
+    duplicate id raises ``ValueError``. The steps are applied in
+    order; for each step every finish id must be taken from that
+    step's current ``U`` and every retry id from its current ``F`` or
+    a ``RuntimeError`` is raised. The transfer is atomic: if any step
+    fails the exception propagates unchanged and every input (and the
+    observable state) is left untouched.
+
+    Returns a dict whose keys in order are ``thresholds``,
+    ``minimums``, ``cursor``, ``state``, ``checkpoints``, ``history``
+    and ``changes``: the first two values recursively copy the
+    same-named entries of ``progress``, ``cursor`` is the length of
+    the given ``history``, ``state`` is the final ascending
+    ``[D, F, U]`` state, ``checkpoints`` lists only the checkpoints
+    produced by this call (empty for an empty ``steps``), ``history``
+    recursively copies every given checkpoint in order and appends
+    the new checkpoints, and ``changes`` lists, per step in order, one
+    ``[p, finished_ids, retried_ids]`` per configuration affected by
+    that step (in the order of ``progress["configs"]``, both id lists
+    sorted ascending); it is an empty list for an empty ``steps``.
+    Every container is recursively copied and JSON-compatible
+    (numbers never rounded); the inputs are never modified.
+    """
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    current, configs = _alert_region_progress(progress)
+    current_sets = [set(group) for group in current]
+    universe = current_sets[0] | current_sets[1] | current_sets[2]
+
+    if not isinstance(steps, (list, tuple)):
+        raise TypeError(
+            f"steps must be a list or tuple, got {type(steps).__name__}"
+        )
+    normalized_steps: list = []
+    for step_index, item in enumerate(steps):
+        if not isinstance(item, (list, tuple)):
+            raise TypeError(
+                f"steps[{step_index}] must be a list or tuple, got "
+                f"{type(item).__name__}"
+            )
+        if len(item) != 2:
+            raise ValueError(
+                f"steps[{step_index}] must have exactly 2 items "
+                f"[finish, retry], got {len(item)}"
+            )
+        step_finish = _alert_region_id_list(
+            item[0], f"steps[{step_index}][0] (finish)"
+        )
+        step_retry = _alert_region_id_list(
+            item[1], f"steps[{step_index}][1] (retry)"
+        )
+        normalized_steps.append((step_finish, step_retry))
+
+    if not isinstance(history, (list, tuple)):
+        raise TypeError(
+            f"history must be a list or tuple, got {type(history).__name__}"
+        )
+    normalized_history = [
+        _alert_region_checkpoint(item, f"history[{history_index}]", universe)
+        for history_index, item in enumerate(history)
+    ]
+    for history_index in range(1, len(normalized_history)):
+        if normalized_history[history_index][0] != \
+                normalized_history[history_index - 1][1]:
+            raise RuntimeError(
+                f"history[{history_index}] pre-state does not follow "
+                f"history[{history_index - 1}] post-state"
+            )
+    if normalized_history and normalized_history[-1][1] != current:
+        raise RuntimeError(
+            "the last history checkpoint post-state does not match the "
+            "current progress state"
+        )
+
+    working_sets = [set(group) for group in current_sets]
+    checkpoints: list = []
+    changes: list = []
+    for step_finish, step_retry in normalized_steps:
+        bad_finish = sorted(
+            region_id for region_id in step_finish
+            if region_id not in working_sets[2]
+        )
+        if bad_finish:
+            raise RuntimeError(
+                "finish ids must be taken from U (unlisted regions), bad "
+                f"id(s): {bad_finish}"
+            )
+        bad_retry = sorted(
+            region_id for region_id in step_retry
+            if region_id not in working_sets[1]
+        )
+        if bad_retry:
+            raise RuntimeError(
+                "retry ids must be taken from F (failed regions), bad "
+                f"id(s): {bad_retry}"
+            )
+
+        pre_state = [sorted(group) for group in working_sets]
+        finish_set = set(step_finish)
+        retry_set = set(step_retry)
+        working_sets = [
+            working_sets[0] | finish_set,
+            working_sets[1] - retry_set,
+            (working_sets[2] - finish_set) | retry_set,
+        ]
+        post_state = [sorted(group) for group in working_sets]
+        checkpoints.append(
+            [pre_state, post_state, sorted(step_finish), sorted(step_retry)]
+        )
+
+        step_changes: list = []
+        for p_value, done_group, failed_group, unlisted_group in configs:
+            regions = set(done_group) | set(failed_group) | set(unlisted_group)
+            finished_here = sorted(finish_set & regions)
+            retried_here = sorted(retry_set & regions)
+            if finished_here or retried_here:
+                step_changes.append([p_value, finished_here, retried_here])
+        changes.append(step_changes)
+
+    history_out = [
+        [
+            [list(group) for group in pre_state],
+            [list(group) for group in post_state],
+            sorted(step_finish),
+            sorted(step_retry),
+        ]
+        for pre_state, post_state, step_finish, step_retry
+        in normalized_history
+    ]
+    history_out.extend(
+        [
+            [
+                [list(group) for group in pre_state],
+                [list(group) for group in post_state],
+                list(step_finish),
+                list(step_retry),
+            ]
+            for pre_state, post_state, step_finish, step_retry in checkpoints
+        ]
+    )
+
+    return {
+        "thresholds": _copy(progress["thresholds"]),
+        "minimums": _copy(progress["minimums"]),
+        "cursor": len(normalized_history),
+        "state": [sorted(group) for group in working_sets],
+        "checkpoints": checkpoints,
         "history": history_out,
         "changes": changes,
     }
