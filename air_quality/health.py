@@ -12,6 +12,7 @@ __all__ = [
     "alert_region_plan",
     "alert_region_progress",
     "alert_region_recover",
+    "alert_region_resume",
     "alert_region_step",
     "aggregate",
     "aggregate_correlated",
@@ -15023,6 +15024,96 @@ def alert_region_recover(records: list | tuple, cursor: int = 0) -> dict:
         "history": _alert_region_copy(last_history),
         "pending": pending,
         "configs": configs,
+    }
+
+
+def alert_region_resume(
+    records: list | tuple, cursor: int = 0, limit: int | None = 1
+) -> dict:
+    """Recover a state and simulate the next pending finish/retry steps.
+
+    ``records`` and ``cursor`` share the contract of
+    :func:`alert_region_recover` (every ``TypeError``, ``ValueError``
+    and ``RuntimeError`` is inherited verbatim; exceptions propagate
+    unchanged). ``limit`` must be ``None`` or a non-bool int >= 1; a
+    wrong type raises ``TypeError`` and a value below 1 raises
+    ``ValueError``. ``limit`` is validated before anything else.
+
+    :func:`alert_region_recover` is called exactly once to obtain
+    ``R``; ``P`` is ``R["pending"]``. When ``limit`` is ``None`` the
+    plan takes all of ``P``, otherwise it takes ``P[:limit]``;
+    ``left`` holds the remaining items. Both keep the original order
+    and are recursively copied.
+
+    The plan is simulated step by step starting from ``R["state"]``
+    ``[D, F, U]``: each plan item ``[finish, retry]`` must draw its
+    finish ids from the current ``U`` and its retry ids from the
+    current ``F`` — otherwise a ``RuntimeError`` is raised — and the
+    state advances to ``D' = D | finish``, ``F' = F - retry``,
+    ``U' = (U - finish) | retry``.
+
+    Returns a dict whose keys in order are ``state``, ``next_state``,
+    ``final``, ``cursor``, ``plan``, ``pending``, ``configs`` and
+    ``history``: ``state`` is a recursive copy of ``R["state"]``,
+    ``next_state`` is the simulated end state (each group sorted by
+    id), ``final`` and ``cursor`` are ``R["final"]`` and ``cursor``,
+    ``plan`` and ``pending`` are the plan and ``left``, and
+    ``configs`` and ``history`` recursively copy ``R``'s same-named
+    values. When ``P`` is empty both ``plan`` and ``pending`` are
+    empty and ``next_state`` equals ``state``. The inputs are never
+    modified, repeated calls with the same input return equal results,
+    and every container is JSON-compatible (numbers never rounded).
+    """
+    if limit is not None:
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise TypeError(
+                "limit must be an int or None, got "
+                f"{type(limit).__name__}"
+            )
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+    recovered = alert_region_recover(records, cursor)
+
+    pending = recovered["pending"]
+    if limit is None:
+        plan = _alert_region_copy(pending)
+        left: list = []
+    else:
+        plan = _alert_region_copy(pending[:limit])
+        left = _alert_region_copy(pending[limit:])
+
+    done, failed, undone = (
+        list(group) for group in _alert_region_copy(recovered["state"])
+    )
+    for step_index, (finish, retry) in enumerate(plan):
+        finish_set = set(finish)
+        retry_set = set(retry)
+        undone_set = set(undone)
+        failed_set = set(failed)
+        if not finish_set <= undone_set:
+            raise RuntimeError(
+                f"plan[{step_index}] finish id(s) not in the current "
+                f"unfinished group: {sorted(finish_set - undone_set)}"
+            )
+        if not retry_set <= failed_set:
+            raise RuntimeError(
+                f"plan[{step_index}] retry id(s) not in the current "
+                f"failed group: {sorted(retry_set - failed_set)}"
+            )
+        done = sorted(set(done) | finish_set)
+        failed = sorted(failed_set - retry_set)
+        undone = sorted((undone_set - finish_set) | retry_set)
+
+    return {
+        "state": _alert_region_copy(recovered["state"]),
+        "next_state": [done, failed, undone],
+        "final": _alert_region_copy(recovered["final"]),
+        "cursor": cursor,
+        "plan": plan,
+        "pending": left,
+        "configs": _alert_region_copy(recovered["configs"]),
+        "history": _alert_region_copy(recovered["history"]),
     }
 
 
