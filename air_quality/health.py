@@ -10,6 +10,7 @@ from .gaussian import _check_finite, _is_number
 __all__ = [
     "aggregate",
     "aggregate_correlated",
+    "alert_region_plan",
     "any_receptor_probability",
     "assess",
     "audit_delta",
@@ -13491,6 +13492,170 @@ def audit_trend_alert_regions(
         "regions": regions,
         "adjacency": adjacency,
         "priority": priority,
+    }
+
+
+def alert_region_plan(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    thresholds: list | tuple,
+    minimums: list | tuple,
+    capacity: int = 10,
+    batch: int = 10,
+) -> dict:
+    """Layered, fixed-batch action plan over the alert regions.
+
+    Every parameter except ``batch`` shares the exact contract of
+    :func:`audit_trend_alert_regions` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`audit_trend_alert_regions` is called exactly once
+    to obtain ``G``. ``batch`` must be a non-bool int >= 1; a wrong type
+    raises ``TypeError`` and a value below 1 raises ``ValueError``.
+
+    Each region's rank is its position in ``G["priority"]`` (rank ``0``
+    first). An undirected graph of the regions is built from
+    ``G["adjacency"]``; every region with a positive ``G["priority"]``
+    score is a seed. A region's layer is the shortest edge count from
+    any seed; multi-source breadth-first search visits every region,
+    seeds at layer ``0``. When there are no seeds, every layer is ``0``.
+
+    ``actions`` orders the regions by ``(layer, rank)``; each action is
+    ``[region, layer, score, member_count, bounds, configs,
+    neighbors]``: ``bounds`` is a copy of the region's two bounds
+    entries ``[threshold_bounds, minimum_bounds]``, ``configs`` is a
+    copy of the region state's ``priority`` entry (``state[1]``), and
+    ``neighbors`` lists the adjacent region ids in ascending order.
+
+    The actions are sliced in that order, ``batch`` actions per batch
+    (the last batch may be shorter); each batch is
+    ``[batch_id, regions, totals]`` where ``batch_id`` starts at ``0``,
+    ``regions`` lists the region ids of the batch's actions, and
+    ``totals`` is ``[cumulative action count, cumulative member count,
+    cumulative score]``; the cumulative score is summed with
+    :func:`math.fsum`.
+
+    ``mapping`` lists, for every configuration ``p`` appearing in any
+    region's configs, the entry ``[p, regions]`` with ``regions`` the
+    ascending list of region ids whose configs contain ``p``; the
+    entries themselves are ordered by ascending ``p``.
+
+    Returns a dict whose keys in order are ``thresholds``,
+    ``minimums``, ``actions``, ``batches`` and ``mapping``; the first
+    two values are the same-named entries of ``G``. Every container is
+    recursively copied and JSON-compatible (``None`` values kept,
+    numbers never rounded); the inputs are never modified.
+    """
+    if not isinstance(batch, int) or isinstance(batch, bool):
+        raise TypeError(f"batch must be an int, got {type(batch).__name__}")
+    if batch < 1:
+        raise ValueError(f"batch must be >= 1, got {batch}")
+
+    grid = audit_trend_alert_regions(
+        snapshots,
+        sizes,
+        settings,
+        thresholds,
+        minimums,
+        capacity,
+    )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    regions = grid["regions"]
+    region_by_id = {region[0]: region for region in regions}
+    region_ids = [region[0] for region in regions]
+
+    rank: dict = {}
+    score: dict = {}
+    member_count: dict = {}
+    for position, entry in enumerate(grid["priority"]):
+        rank[entry[0]] = position
+        score[entry[0]] = entry[1]
+        member_count[entry[0]] = entry[2]
+
+    neighbors: dict = {region_id: [] for region_id in region_ids}
+    for edge in grid["adjacency"]:
+        neighbors[edge[0]].append(edge[1])
+        neighbors[edge[1]].append(edge[0])
+    for region_id in neighbors:
+        neighbors[region_id].sort()
+
+    seeds = [region_id for region_id in region_ids if score[region_id] > 0]
+    layers = {region_id: 0 for region_id in region_ids}
+    if seeds:
+        pending = list(seeds)
+        seen = set(seeds)
+        head = 0
+        while head < len(pending):
+            current = pending[head]
+            head += 1
+            for other in neighbors[current]:
+                if other in seen:
+                    continue
+                seen.add(other)
+                layers[other] = layers[current] + 1
+                pending.append(other)
+
+    ordered_ids = sorted(
+        region_ids, key=lambda region_id: (layers[region_id], rank[region_id])
+    )
+    actions: list = []
+    for region_id in ordered_ids:
+        region = region_by_id[region_id]
+        actions.append(
+            [
+                region_id,
+                layers[region_id],
+                score[region_id],
+                member_count[region_id],
+                [_copy(region[2]), _copy(region[3])],
+                _copy(region[4][1]),
+                [_copy(other) for other in neighbors[region_id]],
+            ]
+        )
+
+    batches: list = []
+    cumulative_actions = 0
+    cumulative_members = 0
+    cumulative_score_terms: list = []
+    for batch_id, beg in enumerate(range(0, len(actions), batch)):
+        end = min(beg + batch, len(actions))
+        chunk = actions[beg:end]
+        cumulative_actions += len(chunk)
+        cumulative_members += sum(item[3] for item in chunk)
+        cumulative_score_terms.extend(item[2] for item in chunk)
+        batches.append(
+            [
+                batch_id,
+                [item[0] for item in chunk],
+                [
+                    cumulative_actions,
+                    cumulative_members,
+                    math.fsum(cumulative_score_terms),
+                ],
+            ]
+        )
+
+    config_regions: dict = {}
+    for region in regions:
+        for p in region[4][1]:
+            config_regions.setdefault(p, []).append(region[0])
+    mapping = [
+        [p, sorted(config_regions[p])] for p in sorted(config_regions)
+    ]
+
+    return {
+        "thresholds": _copy(grid["thresholds"]),
+        "minimums": _copy(grid["minimums"]),
+        "actions": actions,
+        "batches": batches,
+        "mapping": mapping,
     }
 
 
