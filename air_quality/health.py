@@ -14,6 +14,7 @@ __all__ = [
     "assess",
     "audit_delta",
     "audit_reconcile",
+    "audit_window_report",
     "at_least_count_probability",
     "exceedance_probability",
     "excess_interval",
@@ -12296,6 +12297,74 @@ def audit_reconcile(snapshots: list | tuple) -> dict:
         "steps": _copy(steps),
         "retries": [added, removed],
     }
+
+
+def audit_window_report(snapshots: list | tuple, size: int = 2) -> dict:
+    """Sliding-window reconciliation report over audit-chain snapshots.
+
+    ``snapshots`` follows the exact contract of
+    :func:`audit_reconcile`: a non-empty list or tuple of items
+    conforming to the :func:`robust_policy_action_audit_chain` return
+    contract; a wrong container or item type raises ``TypeError`` and
+    an empty sequence raises ``ValueError``.
+
+    ``size`` must be a non-bool ``int`` with ``1 <= size <=
+    len(snapshots)``; a wrong type raises ``TypeError`` and an
+    out-of-range value raises ``ValueError``.
+
+    For each ``e`` from ``size - 1`` through ``len(snapshots) - 1``,
+    :func:`audit_reconcile` is called exactly once on the window
+    ``snapshots[e - size + 1:e + 1]``; its result is denoted ``R`` and
+    every exception propagates unchanged. The corresponding report
+    item is ``[start, e, states, delta, retries]`` where the last three
+    values are recursive copies of the same-named values of ``R``;
+    reports are ordered by ``e``.
+
+    Returns a dict whose keys in order are ``size``, ``reports`` and
+    ``totals``. ``totals`` is accumulated by traversing the reports:
+    ``[sum(delta[5]), sum(delta[6]), sum(len(retries[0])),
+    sum(len(retries[1]))]``, corresponding to completed, remaining,
+    added and removed. Every container is recursively copied and
+    JSON-compatible (``None`` values kept, numbers never rounded); the
+    inputs are never modified.
+    """
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise TypeError(
+            f"size must be a non-bool int, got {type(size).__name__}"
+        )
+    if not isinstance(snapshots, (list, tuple)):
+        raise TypeError(
+            "snapshots must be a list or tuple, got "
+            f"{type(snapshots).__name__}"
+        )
+    if size < 1 or size > len(snapshots):
+        raise ValueError(
+            f"size must satisfy 1 <= size <= len(snapshots) "
+            f"({len(snapshots)}), got {size}"
+        )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    reports: list = []
+    totals = [0, 0, 0, 0]
+    for end in range(size - 1, len(snapshots)):
+        start = end - size + 1
+        reconciled = audit_reconcile(snapshots[start:end + 1])
+        states = _copy(reconciled["states"])
+        delta = _copy(reconciled["delta"])
+        retries = _copy(reconciled["retries"])
+        reports.append([start, end, states, delta, retries])
+        totals[0] += delta[5]
+        totals[1] += delta[6]
+        totals[2] += len(retries[0])
+        totals[3] += len(retries[1])
+
+    return {"size": size, "reports": reports, "totals": totals}
 
 
 def receptor_level_quantile(
