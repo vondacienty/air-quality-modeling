@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_trend_grid",
+    "audit_trend_report",
     "audit_trend_summary",
     "audit_trend_turns",
     "audit_window_report",
@@ -12838,6 +12839,106 @@ def audit_trend_summary(
         "config_events": config_events,
         "field_events": field_events,
         "direction_events": direction_events,
+    }
+
+
+def audit_trend_report(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+) -> dict:
+    """Annotate trend events with coordinates and per-setting counts.
+
+    ``snapshots``, ``sizes`` and ``settings`` share the exact contract
+    of :func:`audit_trend_summary` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged).
+
+    :func:`audit_trend_summary` is called exactly once to obtain ``S``;
+    write ``E = S["events"]`` and ``P = len(settings)``.
+
+    Each entry of ``events`` is ``[e]`` followed by a recursive copy of
+    ``E[e]`` and then ``[C]``, where ``C`` is the ascending list of the
+    distinct position-1 entries of the event's from- and to-coordinates.
+
+    For each ``p = 0..P-1`` write ``I`` for a copy of
+    ``S["config_events"][p]``; ``configs[p]`` is
+    ``[p, setting_copy, I, DC, FC, peak]`` with ``setting_copy`` a
+    recursive copy of ``S["settings"][p]``. ``DC`` counts, in the order
+    ``up``, ``down``, ``shift``, the events of ``I`` with each
+    direction. ``FC`` counts, in the order ``level``, ``first_bad``,
+    ``first_good``, the events of ``I`` whose fields contain that name.
+    ``peak`` is the largest of the before and after levels touched by
+    the events of ``I`` (``None`` when ``I`` is empty).
+
+    ``overview`` is ``[len(E), non_empty_I, global_up, global_down,
+    global_shift]``: ``non_empty_I`` counts the settings with a
+    non-empty ``I`` and each global direction count counts every event
+    of ``E`` exactly once.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``events``, ``configs`` and ``overview``; the first two values are
+    recursive copies of the same-named values of ``S``. Every container
+    is recursively copied and JSON-compatible (``None`` values kept,
+    numbers never rounded); the inputs are never modified.
+    """
+    summary = audit_trend_summary(snapshots, sizes, settings)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    source_events: list = summary["events"]
+    config_events: dict = summary["config_events"]
+    direction_order = ("up", "down", "shift")
+    field_order = ("level", "first_bad", "first_good")
+    direction_index = {name: k for k, name in enumerate(direction_order)}
+
+    events: list = []
+    for e, event in enumerate(source_events):
+        coords = sorted({event[1][1], event[2][1]})
+        events.append([e] + _copy(event) + [coords])
+
+    configs: list = []
+    non_empty = 0
+    for p in range(len(settings)):
+        I = list(config_events[p])
+        if I:
+            non_empty += 1
+        dc = [0, 0, 0]
+        fc = [0, 0, 0]
+        peak = None
+        for e in I:
+            event = source_events[e]
+            dc[direction_index[event[6]]] += 1
+            for k, name in enumerate(field_order):
+                if name in event[5]:
+                    fc[k] += 1
+            level_high = max(event[3][0], event[4][0])
+            if peak is None or level_high > peak:
+                peak = level_high
+        configs.append(
+            [p, _copy(summary["settings"][p]), I, dc, fc, peak]
+        )
+
+    direction_events: dict = summary["direction_events"]
+    overview = [
+        len(source_events),
+        non_empty,
+        len(direction_events["up"]),
+        len(direction_events["down"]),
+        len(direction_events["shift"]),
+    ]
+
+    return {
+        "sizes": _copy(summary["sizes"]),
+        "settings": _copy(summary["settings"]),
+        "events": events,
+        "configs": configs,
+        "overview": overview,
     }
 
 
