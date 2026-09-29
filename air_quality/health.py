@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_trend_grid",
+    "audit_trend_turns",
     "audit_window_report",
     "audit_window_trend",
     "at_least_count_probability",
@@ -12628,6 +12629,121 @@ def audit_trend_grid(
         "settings": [list(setting) for setting in setting_values],
         "warnings": warnings,
         "stability": stability,
+    }
+
+
+def audit_trend_turns(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+) -> dict:
+    """Turning points of the trend-warning grid along both axes.
+
+    Every parameter shares the exact contract of
+    :func:`audit_trend_grid` (every ``TypeError`` and ``ValueError``
+    is inherited verbatim; exceptions propagate unchanged).
+    :func:`audit_trend_grid` is called exactly once to obtain the
+    grid ``G``; write ``W = G["warnings"]``, ``B = len(sizes)`` and
+    ``P = len(settings)``.
+
+    Adjacent warnings along the size axis are compared for every
+    setting, scanned with ``p`` outer and ``b = 1..B - 1`` inner;
+    adjacent warnings along the settings axis are compared for every
+    size, scanned with ``b`` outer and ``p = 1..P - 1`` inner.
+    Whenever two adjacent warnings differ, an event
+    ``[[before_b, before_p], [after_b, after_p], before_copy,
+    after_copy, fields]`` is recorded, where ``fields`` names the
+    changed components of ``[level, first_bad, first_good]`` in that
+    order. Size-axis events form ``size_changes`` and settings-axis
+    events ``setting_changes``; both are empty when nothing changes
+    or the axis has a single point.
+
+    For each ``p`` define
+    ``X[p] = [[W[b][p] for b in range(B)], G["stability"][p]]``;
+    ``consistency[p][q]`` is ``True`` exactly when ``X[p] == X[q]``,
+    giving a P x P matrix of bools.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``size_changes``, ``setting_changes`` and ``consistency``:
+    ``sizes`` and ``settings`` are converted to lists, the two change
+    lists hold the events in the scan orders above and
+    ``consistency`` is the P x P bool matrix. Every container is
+    recursively copied and JSON-compatible (``None`` values kept,
+    numbers never rounded); the inputs are never modified.
+    """
+    grid = audit_trend_grid(snapshots, sizes, settings)
+    warnings = grid["warnings"]
+    size_values = grid["sizes"]
+    setting_values = grid["settings"]
+    n_sizes = len(size_values)
+    n_settings = len(setting_values)
+
+    field_names = ("level", "first_bad", "first_good")
+
+    def _fields(before: list, after: list) -> list:
+        return [
+            name
+            for name, old, new in zip(field_names, before, after)
+            if old != new
+        ]
+
+    size_changes: list = []
+    for p in range(n_settings):
+        for b in range(1, n_sizes):
+            before = warnings[b - 1][p]
+            after = warnings[b][p]
+            fields = _fields(before, after)
+            if fields:
+                size_changes.append(
+                    [
+                        [b - 1, p],
+                        [b, p],
+                        list(before),
+                        list(after),
+                        fields,
+                    ]
+                )
+
+    setting_changes: list = []
+    for b in range(n_sizes):
+        for p in range(1, n_settings):
+            before = warnings[b][p - 1]
+            after = warnings[b][p]
+            fields = _fields(before, after)
+            if fields:
+                setting_changes.append(
+                    [
+                        [b, p - 1],
+                        [b, p],
+                        list(before),
+                        list(after),
+                        fields,
+                    ]
+                )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    profiles = [
+        [
+            [list(warnings[b][p]) for b in range(n_sizes)],
+            _copy(grid["stability"][p]),
+        ]
+        for p in range(n_settings)
+    ]
+    consistency: list = [
+        [profiles[p] == profiles[q] for q in range(n_settings)]
+        for p in range(n_settings)
+    ]
+
+    return {
+        "sizes": list(size_values),
+        "settings": [list(setting) for setting in setting_values],
+        "size_changes": size_changes,
+        "setting_changes": setting_changes,
+        "consistency": consistency,
     }
 
 
