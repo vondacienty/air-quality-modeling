@@ -14,6 +14,7 @@ __all__ = [
     "assess",
     "audit_delta",
     "audit_reconcile",
+    "audit_trend_grid",
     "audit_window_report",
     "audit_window_trend",
     "at_least_count_probability",
@@ -12484,6 +12485,131 @@ def audit_window_trend(
         "windows": windows,
         "runs": runs,
         "warning": [level, fb, fg],
+    }
+
+
+def audit_trend_grid(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+) -> dict:
+    """Warning grid of :func:`audit_window_trend` over sizes and settings.
+
+    ``snapshots`` shares the exact contract of
+    :func:`audit_window_trend` (every ``TypeError`` and ``ValueError``
+    is inherited verbatim and propagates unchanged from the per-cell
+    calls below).
+
+    ``sizes`` must be a non-empty list or tuple of non-bool ints,
+    strictly increasing, each satisfying ``1 <= size <=
+    len(snapshots)``; a wrong container or item type raises
+    ``TypeError`` and an empty sequence, an out-of-range value or a
+    non-increasing sequence raises ``ValueError``. ``settings`` must be
+    a non-empty list or tuple whose every item is a three-element list
+    or tuple of non-bool positive ints ``[done, retries, minimum]``; a
+    wrong container, item or element type raises ``TypeError`` and an
+    empty sequence, an item that is not a triple or a non-positive
+    value raises ``ValueError``.
+
+    Index the sizes by ``b`` and the settings by ``p``. For every cell,
+    with ``sizes`` outer and ``settings`` inner,
+    :func:`audit_window_trend` is called exactly once as
+    ``audit_window_trend(snapshots, sizes[b], done, retries, minimum)``
+    with the three values of ``settings[p]``; a copy of the returned
+    ``warning`` (``[level, fb, fg]``) is stored as ``W[b][p]``.
+
+    For each ``p``, scanning the cells along ascending size, adjacent
+    cells sharing an equal ``W`` are merged into one maximal run; each
+    run is ``[first_size, last_size, warning_copy]``, and the runs of
+    column ``p`` in scan order form ``stability[p]``.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``warnings`` and ``stability``: the first two are list copies of
+    the inputs, ``warnings`` is the ``B x P`` matrix ``W`` and
+    ``stability`` has one run list per setting. Every container is
+    recursively copied and JSON-compatible (``None`` values kept) and
+    the inputs are never modified.
+    """
+    if not isinstance(sizes, (list, tuple)):
+        raise TypeError(
+            "sizes must be a list or tuple, got "
+            f"{type(sizes).__name__}"
+        )
+    if len(sizes) == 0:
+        raise ValueError("sizes must not be empty")
+    previous_size = None
+    for index, size in enumerate(sizes):
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError(
+                f"sizes[{index}] must be a non-bool int, got "
+                f"{type(size).__name__}"
+            )
+        if previous_size is not None and size <= previous_size:
+            raise ValueError(
+                f"sizes must be strictly increasing, got {list(sizes)!r}"
+            )
+        previous_size = size
+
+    if not isinstance(settings, (list, tuple)):
+        raise TypeError(
+            "settings must be a list or tuple, got "
+            f"{type(settings).__name__}"
+        )
+    if len(settings) == 0:
+        raise ValueError("settings must not be empty")
+    setting_names = ("done", "retries", "minimum")
+    for p, setting in enumerate(settings):
+        if not isinstance(setting, (list, tuple)):
+            raise TypeError(
+                f"settings[{p}] must be a list or tuple, got "
+                f"{type(setting).__name__}"
+            )
+        if len(setting) != 3:
+            raise ValueError(
+                f"settings[{p}] must have exactly 3 elements, got "
+                f"{len(setting)}"
+            )
+        for k, value in enumerate(setting):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"settings[{p}][{k}] ({setting_names[k]}) must be a "
+                    f"non-bool int, got {type(value).__name__}"
+                )
+            if value < 1:
+                raise ValueError(
+                    f"settings[{p}][{k}] ({setting_names[k]}) must be "
+                    f">= 1, got {value}"
+                )
+
+    warnings: list[list[list]] = []
+    for size in sizes:
+        row: list[list] = []
+        for setting in settings:
+            trend = audit_window_trend(
+                snapshots, size, setting[0], setting[1], setting[2]
+            )
+            row.append(list(trend["warning"]))
+        warnings.append(row)
+
+    stability: list[list[list]] = []
+    for p in range(len(settings)):
+        runs: list[list] = []
+        start = 0
+        total = len(sizes)
+        while start < total:
+            last = start
+            current = warnings[start][p]
+            while last + 1 < total and warnings[last + 1][p] == current:
+                last += 1
+            runs.append([sizes[start], sizes[last], list(current)])
+            start = last + 1
+        stability.append(runs)
+
+    return {
+        "sizes": list(sizes),
+        "settings": [list(setting) for setting in settings],
+        "warnings": warnings,
+        "stability": stability,
     }
 
 
