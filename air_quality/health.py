@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_trend_alert_grid",
+    "audit_trend_alert_regions",
     "audit_trend_batch_alerts",
     "audit_trend_batches",
     "audit_trend_grid",
@@ -13331,6 +13332,165 @@ def audit_trend_alert_grid(
         "reports": reports,
         "changes": changes,
         "focus": focus,
+    }
+
+
+def audit_trend_alert_regions(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    thresholds: list | tuple,
+    minimums: list | tuple,
+    capacity: int = 10,
+) -> dict:
+    """Orthogonally connected regions of equal states on the alert grid.
+
+    Every parameter shares the contract of
+    :func:`audit_trend_alert_grid` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). :func:`audit_trend_alert_grid` is called exactly once
+    to obtain the grid ``G``.
+
+    A cell ``[a, b]`` is adjacent only to its up, down, left and right
+    neighbours, and two cells share a state when the corresponding
+    entries of ``G["reports"]`` compare equal. Cells are scanned with
+    ``a`` outer and ``b`` inner, skipping cells already assigned; each
+    flood fill gathers every orthogonally reachable cell with the same
+    state into one region. Region ids increase from ``0`` in scan
+    order, and each region's members are sorted by ``(a, b)``. Each
+    region is ``[id, cells, threshold_bounds, minimum_bounds, state]``:
+    ``cells`` lists the ``[a, b]`` members, ``threshold_bounds`` is the
+    two-element list of the ``G["thresholds"]`` values at the extreme
+    member ``a`` indices, ``minimum_bounds`` is the analogous list of
+    ``G["minimums"]`` values for the extreme member ``b`` indices, and
+    ``state`` is a recursive list copy of the region's state.
+
+    Two distinct regions with any orthogonally adjacent members form an
+    edge ``[smaller id, larger id, fields]``; ``fields`` lists, in the
+    order ``runs``, ``priority``, the state positions whose values
+    differ between the two regions. Edges are deduplicated by the id
+    pair and sorted by the two ids.
+
+    For each ``[p, c]`` entry of ``G["focus"]``, a region scores the
+    ``c`` of every ``p`` that occurs in that region's state
+    ``priority``; the region score is their sum. ``priority`` lists
+    ``[id, score, member_count]`` for every region, ordered by
+    ``(-score, -member_count, id)``.
+
+    Returns a dict whose keys in order are ``thresholds``,
+    ``minimums``, ``regions``, ``adjacency`` and ``priority``; the
+    first two values are taken from ``G``. Every container is
+    recursively copied and JSON-compatible (``None`` values kept,
+    numbers never rounded); the inputs are never modified.
+    """
+    grid = audit_trend_alert_grid(
+        snapshots, sizes, settings, thresholds, minimums, capacity
+    )
+    reports = grid["reports"]
+    threshold_values = grid["thresholds"]
+    minimum_values = grid["minimums"]
+    a_count = len(threshold_values)
+    b_count = len(minimum_values)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    region_of: dict[tuple[int, int], int] = {}
+    regions: list = []
+    for a0 in range(a_count):
+        for b0 in range(b_count):
+            if (a0, b0) in region_of:
+                continue
+            region_id = len(regions)
+            state = reports[a0][b0]
+            cells: list[list[int]] = []
+            pending = [(a0, b0)]
+            region_of[(a0, b0)] = region_id
+            while pending:
+                a, b = pending.pop()
+                cells.append([a, b])
+                for na, nb in (
+                    (a - 1, b), (a + 1, b), (a, b - 1), (a, b + 1)
+                ):
+                    if not (0 <= na < a_count and 0 <= nb < b_count):
+                        continue
+                    if (na, nb) in region_of:
+                        continue
+                    if reports[na][nb] != state:
+                        continue
+                    region_of[(na, nb)] = region_id
+                    pending.append((na, nb))
+            cells.sort(key=lambda cell: (cell[0], cell[1]))
+            a_min = cells[0][0]
+            a_max = cells[-1][0]
+            b_min = min(cell[1] for cell in cells)
+            b_max = max(cell[1] for cell in cells)
+            regions.append(
+                [
+                    region_id,
+                    cells,
+                    [threshold_values[a_min], threshold_values[a_max]],
+                    [minimum_values[b_min], minimum_values[b_max]],
+                    _copy(state),
+                ]
+            )
+
+    state_fields = ("runs", "priority")
+    edge_fields: dict[tuple[int, int], list] = {}
+
+    def _edge_fields(former: list, latter: list) -> list:
+        return [
+            state_fields[k]
+            for k in range(2)
+            if former[k] != latter[k]
+        ]
+
+    for a in range(a_count):
+        for b in range(b_count):
+            current = region_of[(a, b)]
+            if a + 1 < a_count:
+                other = region_of[(a + 1, b)]
+                if other != current:
+                    pair = (
+                        (current, other) if current < other else (other, current)
+                    )
+                    if pair not in edge_fields:
+                        edge_fields[pair] = _edge_fields(
+                            reports[a][b], reports[a + 1][b]
+                        )
+            if b + 1 < b_count:
+                other = region_of[(a, b + 1)]
+                if other != current:
+                    pair = (
+                        (current, other) if current < other else (other, current)
+                    )
+                    if pair not in edge_fields:
+                        edge_fields[pair] = _edge_fields(
+                            reports[a][b], reports[a][b + 1]
+                        )
+    adjacency = [
+        [small, large, list(edge_fields[(small, large)])]
+        for small, large in sorted(edge_fields)
+    ]
+
+    focus = grid["focus"]
+    priority: list = []
+    for region in regions:
+        region_id = region[0]
+        members = region[1]
+        state_priority = region[4][1]
+        score = sum(c for p, c in focus if p in state_priority)
+        priority.append([region_id, score, len(members)])
+    priority.sort(key=lambda item: (-item[1], -item[2], item[0]))
+
+    return {
+        "thresholds": list(threshold_values),
+        "minimums": list(minimum_values),
+        "regions": regions,
+        "adjacency": adjacency,
+        "priority": priority,
     }
 
 
