@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_trend_grid",
+    "audit_trend_summary",
     "audit_trend_turns",
     "audit_window_report",
     "audit_window_trend",
@@ -12731,6 +12732,112 @@ def audit_trend_turns(
         "size_changes": size_changes,
         "setting_changes": setting_changes,
         "consistency": consistency,
+    }
+
+
+def audit_trend_summary(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+) -> dict:
+    """Normalize trend turns into indexed events grouped three ways.
+
+    ``snapshots``, ``sizes`` and ``settings`` share the exact contract
+    of :func:`audit_trend_turns` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged).
+
+    :func:`audit_trend_turns` is called exactly once to obtain ``T``.
+    The entries of ``T["size_changes"]`` followed by the entries of
+    ``T["setting_changes"]`` are traversed in that order; with the
+    zero-based event index ``e`` in this traversal, each entry ``x`` is
+    normalized as
+    ``[axis, x[0], x[1], x[2], x[3], x[4], direction]``, where ``axis``
+    is ``"size"`` for the first list and ``"setting"`` for the second.
+    Comparing the level of the latter cell with the former cell,
+    ``direction`` is ``"up"`` when ``x[3][0] > x[2][0]``, ``"down"``
+    when ``x[3][0] < x[2][0]`` and ``"shift"`` when they are equal.
+
+    ``config_events[p]`` lists, in ascending order, the event indices
+    whose either end coordinate has its position-1 entry equal to ``p``;
+    each event contributes at most once. ``field_events`` is a dict with
+    keys in the order ``level``, ``first_bad``, ``first_good``; each
+    value lists, in ascending order, the event indices whose ``x[4]``
+    contains that key. ``direction_events`` is a dict with keys in the
+    order ``up``, ``down``, ``shift``; each value lists, in ascending
+    order, the event indices with that direction.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``events``, ``config_events``, ``field_events`` and
+    ``direction_events``; the first two values are the same-named
+    values of ``T``. Every container is recursively copied and
+    JSON-compatible (``None`` values kept, numbers never rounded); the
+    inputs are never modified.
+    """
+    turns = audit_trend_turns(snapshots, sizes, settings)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    events: list = []
+    config_events: dict = {
+        p: [] for p in range(len(turns["settings"]))
+    }
+    field_events: dict = {
+        "level": [],
+        "first_bad": [],
+        "first_good": [],
+    }
+    direction_events: dict = {
+        "up": [],
+        "down": [],
+        "shift": [],
+    }
+
+    for axis, change_list in (
+        ("size", turns["size_changes"]),
+        ("setting", turns["setting_changes"]),
+    ):
+        for x in change_list:
+            e = len(events)
+            if x[3][0] > x[2][0]:
+                direction = "up"
+            elif x[3][0] < x[2][0]:
+                direction = "down"
+            else:
+                direction = "shift"
+            events.append(
+                [
+                    axis,
+                    _copy(x[0]),
+                    _copy(x[1]),
+                    _copy(x[2]),
+                    _copy(x[3]),
+                    _copy(x[4]),
+                    direction,
+                ]
+            )
+            matched: set = set()
+            for coordinate in (x[0], x[1]):
+                p = coordinate[1]
+                if p not in matched:
+                    matched.add(p)
+                    config_events[p].append(e)
+            for key in x[4]:
+                field_events[key].append(e)
+            direction_events[direction].append(e)
+
+    return {
+        "sizes": _copy(turns["sizes"]),
+        "settings": _copy(turns["settings"]),
+        "events": events,
+        "config_events": config_events,
+        "field_events": field_events,
+        "direction_events": direction_events,
     }
 
 
