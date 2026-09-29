@@ -14,6 +14,7 @@ __all__ = [
     "assess",
     "audit_delta",
     "audit_reconcile",
+    "audit_trend_alert_grid",
     "audit_trend_batch_alerts",
     "audit_trend_batches",
     "audit_trend_grid",
@@ -13170,6 +13171,166 @@ def audit_trend_batch_alerts(
         "minimum": minimum,
         "runs": runs,
         "priority": priority,
+    }
+
+
+def audit_trend_alert_grid(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    thresholds: list | tuple,
+    minimums: list | tuple,
+    capacity: int = 10,
+) -> dict:
+    """Grid of batch-alert reports over thresholds and minimums.
+
+    ``snapshots``, ``sizes``, ``settings`` and ``capacity`` share the
+    exact contract of :func:`audit_trend_batch_alerts` (every
+    ``TypeError`` and ``ValueError`` is inherited verbatim; exceptions
+    propagate unchanged). ``thresholds`` and ``minimums`` must each be
+    a non-empty list or tuple of strictly increasing non-bool positive
+    ints; a wrong container or element type raises ``TypeError``, while
+    an empty axis, a non-positive value or a non-increasing pair raises
+    ``ValueError``.
+
+    With threshold index ``a`` as the outer axis and minimum index
+    ``b`` as the inner axis, :func:`audit_trend_batch_alerts` is called
+    exactly once per cell as
+    ``audit_trend_batch_alerts(snapshots, sizes, settings, capacity,
+    thresholds[a], minimums[b])``; the cell state, stored as
+    ``reports[a][b]``, is ``[runs, priority]``, a recursive copy of the
+    report's same-named values.
+
+    Adjacent states are compared along two sweeps. The threshold-axis
+    sweep visits, for each ``b`` (in ascending order) and then
+    ``a = 1..A-1``, ``reports[a-1][b]`` and ``reports[a][b]``; the
+    minimum-axis sweep visits, for each ``a`` and then ``b = 1..B-1``,
+    ``reports[a][b-1]`` and ``reports[a][b]``. Whenever two adjacent
+    states differ, ``[axis, former_coordinate, latter_coordinate,
+    fields]`` is recorded: ``axis`` is ``"threshold"`` for the first
+    sweep and ``"minimum"`` for the second; the coordinates are the
+    ``[a, b]`` indices of the former and latter cell; and ``fields``
+    lists, in the order ``runs``, ``priority``, the state positions
+    whose values differ.
+
+    ``focus`` counts, for each configuration ``p``, the number of cells
+    ``c`` in which ``p`` occurs in the cell state's ``priority``; only
+    ``[p, c]`` pairs with ``c > 0`` are kept, ordered by ``(-c, p)``.
+
+    Returns a dict whose keys in order are ``thresholds``,
+    ``minimums``, ``reports``, ``changes`` and ``focus``; the first two
+    values are converted to lists. Every container is recursively
+    copied and JSON-compatible (``None`` values kept, numbers never
+    rounded); the inputs are never modified.
+    """
+
+    def _validate_axis(name: str, values: list | tuple) -> list:
+        if not isinstance(values, (list, tuple)):
+            raise TypeError(
+                f"{name} must be a list or tuple, got {type(values).__name__}"
+            )
+        if len(values) == 0:
+            raise ValueError(f"{name} must not be empty")
+        axis: list = []
+        for j, value in enumerate(values):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{name}[{j}] must be a non-bool int, got "
+                    f"{type(value).__name__}"
+                )
+            if value < 1:
+                raise ValueError(f"{name}[{j}] must be >= 1, got {value}")
+            if j > 0 and value <= axis[j - 1]:
+                raise ValueError(
+                    f"{name} must be strictly increasing, got "
+                    f"{[*axis, value]!r}"
+                )
+            axis.append(value)
+        return axis
+
+    threshold_values = _validate_axis("thresholds", thresholds)
+    minimum_values = _validate_axis("minimums", minimums)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    a_count = len(threshold_values)
+    b_count = len(minimum_values)
+
+    reports: list = [[None] * b_count for _ in range(a_count)]
+    for a, threshold in enumerate(threshold_values):
+        for b, minimum in enumerate(minimum_values):
+            result = audit_trend_batch_alerts(
+                snapshots,
+                sizes,
+                settings,
+                capacity,
+                threshold,
+                minimum,
+            )
+            reports[a][b] = [_copy(result["runs"]), _copy(result["priority"])]
+
+    state_fields = ("runs", "priority")
+
+    def _changed_fields(former: list, latter: list) -> list:
+        return [
+            state_fields[k]
+            for k in range(2)
+            if former[k] != latter[k]
+        ]
+
+    changes: list = []
+    for b in range(b_count):
+        for a in range(1, a_count):
+            former = reports[a - 1][b]
+            latter = reports[a][b]
+            if former != latter:
+                changes.append(
+                    [
+                        "threshold",
+                        [a - 1, b],
+                        [a, b],
+                        _changed_fields(former, latter),
+                    ]
+                )
+    for a in range(a_count):
+        for b in range(1, b_count):
+            former = reports[a][b - 1]
+            latter = reports[a][b]
+            if former != latter:
+                changes.append(
+                    [
+                        "minimum",
+                        [a, b - 1],
+                        [a, b],
+                        _changed_fields(former, latter),
+                    ]
+                )
+
+    p_count = len(settings)
+    focus_counts = {p: 0 for p in range(p_count)}
+    for a in range(a_count):
+        for b in range(b_count):
+            for p in reports[a][b][1]:
+                focus_counts[p] += 1
+    focus = [
+        [p, count]
+        for p, count in sorted(
+            focus_counts.items(), key=lambda item: (-item[1], item[0])
+        )
+        if count > 0
+    ]
+
+    return {
+        "thresholds": list(threshold_values),
+        "minimums": list(minimum_values),
+        "reports": reports,
+        "changes": changes,
+        "focus": focus,
     }
 
 
