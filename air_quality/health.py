@@ -14,6 +14,7 @@ __all__ = [
     "assess",
     "audit_delta",
     "audit_reconcile",
+    "audit_trend_batch_alerts",
     "audit_trend_batches",
     "audit_trend_grid",
     "audit_trend_report",
@@ -13056,6 +13057,133 @@ def audit_trend_batches(
             direction_totals,
             changes_totals,
         ],
+    }
+
+
+def audit_trend_batch_alerts(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    capacity: int = 10,
+    threshold: int = 1,
+    minimum: int = 1,
+) -> dict:
+    """Maximal active batch runs per setting column.
+
+    ``snapshots``, ``sizes``, ``settings`` and ``capacity`` share the
+    exact contract of :func:`audit_trend_batches` (every ``TypeError``
+    and ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged). ``threshold`` and ``minimum`` must each be a non-bool
+    int >= 1; a wrong type raises ``TypeError`` and a value below 1
+    raises ``ValueError``.
+
+    :func:`audit_trend_batches` is called exactly once to obtain ``A``
+    and is never called again. Write ``P = len(settings)``. For each
+    configuration ``p = 0..P-1`` the batches of ``A["batches"]`` are
+    scanned in batch order; a batch ``b`` is *active* for ``p`` when
+    ``abs(changes[p]) >= threshold`` (the batch's ``changes`` is
+    ``batch[4]``). Consecutive active batches are merged into maximal
+    runs and only runs whose length is at least ``minimum`` are kept.
+    Each run is ``[p, first_batch, last_batch, length, net, peak]``
+    where ``net`` is the :func:`math.fsum` of the run's changes for
+    ``p`` and ``peak`` is the maximum of the run's ``peaks[p]`` values
+    (batch ``peaks`` is ``batch[3]``); every active batch has a
+    non-``None`` peak for ``p``. All runs are ordered by
+    ``(p, first_batch)``.
+
+    ``priority`` lists the configurations having at least one run,
+    ordered by the :func:`math.fsum` of ``abs(net)`` over that
+    configuration's runs (descending), then by the number of batches
+    covered by its runs (descending), then by ``p`` (ascending).
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``capacity``, ``threshold``, ``minimum``, ``runs`` and
+    ``priority``; the first three values copy the same-named values of
+    ``A``. When no configuration has a qualifying run, ``runs`` and
+    ``priority`` are both empty. Every container is recursively copied
+    and JSON-compatible (numbers never rounded); the inputs are never
+    modified.
+    """
+    if not isinstance(capacity, int) or isinstance(capacity, bool):
+        raise TypeError(
+            f"capacity must be an int, got {type(capacity).__name__}"
+        )
+    if capacity < 1:
+        raise ValueError(f"capacity must be >= 1, got {capacity}")
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        raise TypeError(
+            "threshold must be a non-bool int, got "
+            f"{type(threshold).__name__}"
+        )
+    if not isinstance(minimum, int) or isinstance(minimum, bool):
+        raise TypeError(
+            "minimum must be a non-bool int, got "
+            f"{type(minimum).__name__}"
+        )
+    if threshold < 1:
+        raise ValueError(f"threshold must be >= 1, got {threshold}")
+    if minimum < 1:
+        raise ValueError(f"minimum must be >= 1, got {minimum}")
+
+    batched = audit_trend_batches(snapshots, sizes, settings, capacity)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    batches = batched["batches"]
+    p_count = len(settings)
+    batch_count = len(batches)
+
+    runs: list = []
+    per_config: list = []
+    for p in range(p_count):
+        config_runs: list = []
+        b = 0
+        while b < batch_count:
+            if abs(batches[b][4][p]) < threshold:
+                b += 1
+                continue
+            first = b
+            while (
+                b + 1 < batch_count
+                and abs(batches[b + 1][4][p]) >= threshold
+            ):
+                b += 1
+            last = b
+            length = last - first + 1
+            if length >= minimum:
+                net = math.fsum(batches[k][4][p] for k in range(first, last + 1))
+                peak = batches[first][3][p]
+                for k in range(first + 1, last + 1):
+                    candidate = batches[k][3][p]
+                    if candidate > peak:
+                        peak = candidate
+                run = [p, first, last, length, net, peak]
+                config_runs.append(run)
+                runs.append(run)
+            b = last + 1
+        per_config.append(config_runs)
+
+    priority: list = []
+    for p, config_runs in enumerate(per_config):
+        if config_runs:
+            net_weight = math.fsum(abs(run[4]) for run in config_runs)
+            covered = sum(run[3] for run in config_runs)
+            priority.append((p, net_weight, covered))
+    priority.sort(key=lambda item: (-item[1], -item[2], item[0]))
+
+    return {
+        "sizes": _copy(batched["sizes"]),
+        "settings": _copy(batched["settings"]),
+        "capacity": capacity,
+        "threshold": threshold,
+        "minimum": minimum,
+        "runs": _copy(runs),
+        "priority": [item[0] for item in priority],
     }
 
 
