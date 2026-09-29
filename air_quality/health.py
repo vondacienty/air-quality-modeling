@@ -14,6 +14,7 @@ __all__ = [
     "assess",
     "audit_delta",
     "audit_reconcile",
+    "audit_trend_alert_grid",
     "audit_trend_batch_alerts",
     "audit_trend_batches",
     "audit_trend_grid",
@@ -13170,6 +13171,148 @@ def audit_trend_batch_alerts(
         "minimum": minimum,
         "runs": runs,
         "priority": priority,
+    }
+
+
+def audit_trend_alert_grid(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+    thresholds: list | tuple,
+    minimums: list | tuple,
+    capacity: int = 10,
+) -> dict:
+    """Grid of batch-alert reports over thresholds and minimums.
+
+    ``snapshots``, ``sizes``, ``settings`` and ``capacity`` share the
+    exact contract of :func:`audit_trend_batch_alerts` (every
+    ``TypeError`` and ``ValueError`` is inherited verbatim; exceptions
+    propagate unchanged). ``thresholds`` and ``minimums`` must each be
+    a non-empty list or tuple of strictly increasing non-bool positive
+    ints; a wrong container or element type raises ``TypeError``, while
+    an empty axis, a non-positive value or a non-increasing pair raises
+    ``ValueError``.
+
+    With threshold index ``a`` as the outer axis and minimum index ``b``
+    as the inner axis, :func:`audit_trend_batch_alerts` is called
+    exactly once per cell as
+    ``audit_trend_batch_alerts(snapshots, sizes, settings, capacity, t, m)``
+    and the returned report is stored as ``reports[a][b]``. The cell
+    state is the report's ``[runs, priority]`` pair.
+
+    ``changes`` lists every adjacent state difference. It first scans
+    the threshold axis for each ``(b, a)`` with ``a = 1..A-1`` (in
+    ``b`` then ``a`` order), comparing ``reports[a-1][b]`` with
+    ``reports[a][b]``; it then scans the minimum axis for each
+    ``(a, b)`` with ``b = 1..B-1`` (in ``a`` then ``b`` order),
+    comparing ``reports[a][b-1]`` with ``reports[a][b]``. Each
+    difference is ``[axis, before, after, fields]``: ``axis`` is
+    ``"threshold"`` or ``"minimum"``, and ``before``/``after`` are the
+    two axis coordinates ``[a, b]``. ``fields`` lists, in the order
+    ``runs`` then ``priority``, the names of the state entries whose
+    values differ.
+
+    ``focus`` counts, for each configuration ``p`` appearing in any
+    cell's ``priority``, its occurrence count ``c``; only ``[p, c]``
+    pairs with ``c > 0`` are kept, sorted by ``(-c, p)`` ascending.
+
+    Returns a dict whose keys in order are ``thresholds``,
+    ``minimums``, ``reports``, ``changes`` and ``focus``; the first two
+    values are converted to lists. Every container is recursively
+    copied and JSON-compatible (``None`` values kept, numbers never
+    rounded); the inputs are never modified.
+    """
+
+    def _validate_positive_int_axis(name: str, values: object) -> list:
+        if not isinstance(values, (list, tuple)):
+            raise TypeError(
+                f"{name} must be a list or tuple, got {type(values).__name__}"
+            )
+        if len(values) == 0:
+            raise ValueError(f"{name} must not be empty")
+        result: list = []
+        for j, value in enumerate(values):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"{name}[{j}] must be a non-bool int, got "
+                    f"{type(value).__name__}"
+                )
+            if value < 1:
+                raise ValueError(f"{name}[{j}] must be >= 1, got {value}")
+            if j > 0 and value <= result[j - 1]:
+                raise ValueError(
+                    f"{name} must be strictly increasing, got "
+                    f"{[*result, value]!r}"
+                )
+            result.append(value)
+        return result
+
+    threshold_values = _validate_positive_int_axis("thresholds", thresholds)
+    minimum_values = _validate_positive_int_axis("minimums", minimums)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    reports: list = []
+    for t in threshold_values:
+        row: list = []
+        for m in minimum_values:
+            row.append(
+                audit_trend_batch_alerts(
+                    snapshots, sizes, settings, capacity, t, m
+                )
+            )
+        reports.append(row)
+
+    def _state(a: int, b: int) -> list:
+        return [reports[a][b]["runs"], reports[a][b]["priority"]]
+
+    changes: list = []
+    field_names = ("runs", "priority")
+    for b in range(len(minimum_values)):
+        for a in range(1, len(threshold_values)):
+            before = _state(a - 1, b)
+            after = _state(a, b)
+            if before != after:
+                fields = [
+                    field_names[k]
+                    for k in range(2)
+                    if before[k] != after[k]
+                ]
+                changes.append(
+                    ["threshold", [a - 1, b], [a, b], fields]
+                )
+    for a in range(len(threshold_values)):
+        for b in range(1, len(minimum_values)):
+            before = _state(a, b - 1)
+            after = _state(a, b)
+            if before != after:
+                fields = [
+                    field_names[k]
+                    for k in range(2)
+                    if before[k] != after[k]
+                ]
+                changes.append(
+                    ["minimum", [a, b - 1], [a, b], fields]
+                )
+
+    counts: dict[int, int] = {}
+    for a in range(len(threshold_values)):
+        for b in range(len(minimum_values)):
+            for p in reports[a][b]["priority"]:
+                counts[p] = counts.get(p, 0) + 1
+    focus = [[p, counts[p]] for p in sorted(counts, key=lambda p: (-counts[p], p))]
+
+    return {
+        "thresholds": list(threshold_values),
+        "minimums": list(minimum_values),
+        "reports": _copy(reports),
+        "changes": changes,
+        "focus": focus,
     }
 
 
