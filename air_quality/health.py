@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_window_report",
+    "audit_window_trend",
     "at_least_count_probability",
     "exceedance_probability",
     "excess_interval",
@@ -12306,7 +12307,9 @@ def audit_window_report(snapshots: list | tuple, size: int = 2) -> dict:
     :func:`audit_reconcile`: a non-empty list or tuple of items
     conforming to the :func:`robust_policy_action_audit_chain` return
     contract; a wrong container or item type raises ``TypeError`` and
-    an empty sequence raises ``ValueError``.
+    an empty sequence raises ``ValueError``. The empty-``snapshots``
+    check runs before the ``size`` checks, so an empty sequence always
+    reports that the input is empty.
 
     ``size`` must be a non-bool ``int`` with ``1 <= size <=
     len(snapshots)``; a wrong type raises ``TypeError`` and an
@@ -12328,14 +12331,16 @@ def audit_window_report(snapshots: list | tuple, size: int = 2) -> dict:
     JSON-compatible (``None`` values kept, numbers never rounded); the
     inputs are never modified.
     """
-    if not isinstance(size, int) or isinstance(size, bool):
-        raise TypeError(
-            f"size must be a non-bool int, got {type(size).__name__}"
-        )
     if not isinstance(snapshots, (list, tuple)):
         raise TypeError(
             "snapshots must be a list or tuple, got "
             f"{type(snapshots).__name__}"
+        )
+    if len(snapshots) == 0:
+        raise ValueError("snapshots must not be empty")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise TypeError(
+            f"size must be a non-bool int, got {type(size).__name__}"
         )
     if size < 1 or size > len(snapshots):
         raise ValueError(
@@ -12365,6 +12370,146 @@ def audit_window_report(snapshots: list | tuple, size: int = 2) -> dict:
         totals[3] += len(retries[1])
 
     return {"size": size, "reports": reports, "totals": totals}
+
+
+def audit_window_trend(
+    snapshots: list | tuple,
+    size: int = 2,
+    done: int = 1,
+    retries: int = 1,
+    minimum: int = 2,
+) -> dict:
+    """Classify sliding-window reconciliation reports into trend states.
+
+    ``snapshots`` and ``size`` follow the exact contract of
+    :func:`audit_window_report` (including the validation order: the
+    empty-``snapshots`` check precedes the ``size`` checks); a wrong
+    container type raises ``TypeError`` and an empty sequence raises
+    ``ValueError`` with a message stating that the input is empty.
+
+    ``done``, ``retries`` and ``minimum`` must each be a non-bool
+    ``int`` >= 1; a wrong type raises ``TypeError`` and a value below 1
+    raises ``ValueError``.
+
+    :func:`audit_window_report` is called exactly once with
+    ``snapshots`` and ``size``; its result is denoted ``W`` and every
+    exception propagates unchanged. For each report ``x`` of
+    ``W["reports"]``, in order, define::
+
+        d = x[3][5]                       # completed within the window
+        r = -x[3][6]                      # remaining consumed (>= 0)
+        n = len(x[4][0]) - len(x[4][1])  # added minus removed retry chains
+
+    The window state is ``-1`` (worsening) when ``n >= retries``;
+    otherwise it is ``1`` (recovering) when ``d >= done`` and
+    ``r >= done``; otherwise it is ``0`` (steady). Each ``windows``
+    entry is ``[start, end, d, r, n, state]``, copying ``x[0]`` and
+    ``x[1]``.
+
+    Adjacent windows sharing one non-zero state form maximal segments;
+    only segments whose length is at least ``minimum`` are kept. Each
+    ``runs`` entry is ``[state, first_window_index, last_window_index]``
+    with indices into ``windows``.
+
+    ``warning`` is ``[level, fb, fg]`` where ``fb`` and ``fg`` are the
+    indices into ``runs`` of the first ``-1`` and first ``1`` segment,
+    respectively, or ``None`` when no such segment exists. ``level`` is
+    2 when a ``-1`` segment exists; otherwise it is 1 when at least one
+    window has a state different from 1; otherwise it is 0.
+
+    Returns a dict whose keys in order are ``size``, ``windows``,
+    ``runs`` and ``warning``. Every container is recursively copied and
+    JSON-compatible (``None`` values kept, numbers never rounded); the
+    inputs are never modified.
+    """
+    if not isinstance(snapshots, (list, tuple)):
+        raise TypeError(
+            "snapshots must be a list or tuple, got "
+            f"{type(snapshots).__name__}"
+        )
+    if len(snapshots) == 0:
+        raise ValueError("snapshots must not be empty")
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise TypeError(
+            f"size must be a non-bool int, got {type(size).__name__}"
+        )
+    if size < 1 or size > len(snapshots):
+        raise ValueError(
+            f"size must satisfy 1 <= size <= len(snapshots) "
+            f"({len(snapshots)}), got {size}"
+        )
+    for param_name, param_value in (
+        ("done", done),
+        ("retries", retries),
+        ("minimum", minimum),
+    ):
+        if not isinstance(param_value, int) or isinstance(param_value, bool):
+            raise TypeError(
+                f"{param_name} must be a non-bool int, got "
+                f"{type(param_value).__name__}"
+            )
+        if param_value < 1:
+            raise ValueError(
+                f"{param_name} must be >= 1, got {param_value}"
+            )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    window_report = audit_window_report(snapshots, size)
+
+    windows: list = []
+    for x in window_report["reports"]:
+        d_value = x[3][5]
+        r_value = -x[3][6]
+        n_value = len(x[4][0]) - len(x[4][1])
+        if n_value >= retries:
+            state = -1
+        elif d_value >= done and r_value >= done:
+            state = 1
+        else:
+            state = 0
+        windows.append([x[0], x[1], d_value, r_value, n_value, state])
+
+    runs: list = []
+    index = 0
+    while index < len(windows):
+        state = windows[index][5]
+        if state == 0:
+            index += 1
+            continue
+        end = index
+        while end + 1 < len(windows) and windows[end + 1][5] == state:
+            end += 1
+        if end - index + 1 >= minimum:
+            runs.append([state, index, end])
+        index = end + 1
+
+    first_bad: int | None = None
+    first_good: int | None = None
+    for run_index, run in enumerate(runs):
+        if run[0] == -1 and first_bad is None:
+            first_bad = run_index
+        elif run[0] == 1 and first_good is None:
+            first_good = run_index
+
+    if first_bad is not None:
+        level = 2
+    elif any(window[5] != 1 for window in windows):
+        level = 1
+    else:
+        level = 0
+
+    return {
+        "size": size,
+        "windows": _copy(windows),
+        "runs": _copy(runs),
+        "warning": [level, first_bad, first_good],
+    }
 
 
 def receptor_level_quantile(
