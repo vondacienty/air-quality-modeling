@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_trend_grid",
+    "audit_trend_report",
     "audit_trend_summary",
     "audit_trend_turns",
     "audit_window_report",
@@ -12838,6 +12839,120 @@ def audit_trend_summary(
         "config_events": config_events,
         "field_events": field_events,
         "direction_events": direction_events,
+    }
+
+
+def audit_trend_report(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+) -> dict:
+    """Per-event coordinates and per-setting tallies of the trend audit.
+
+    ``snapshots``, ``sizes`` and ``settings`` share the exact contract
+    of :func:`audit_trend_summary` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged).
+
+    :func:`audit_trend_summary` is called exactly once to obtain ``S``;
+    write ``E = S["events"]`` and ``P = len(settings)``. The event
+    report ``events[e]`` is
+    ``[e] + recursive_copy(E[e]) + [C]``, where ``C`` lists, without
+    duplicates and in ascending order, the position-1 (second) entries
+    of the event's ``from`` and ``to`` coordinates ``E[e][1]`` and
+    ``E[e][2]``; these are the setting columns touched by the event.
+
+    For each ``p = 0..P-1``, ``I`` is a copy of
+    ``S["config_events"][p]`` and ``configs[p]`` is
+    ``[p, copy(S["settings"][p]), I, DC, FC, peak]``:
+
+    * ``DC`` counts, in the order ``up``, ``down``, ``shift``, the
+      events of ``I`` with each direction;
+    * ``FC`` counts, in the order ``level``, ``first_bad``,
+      ``first_good``, the events of ``I`` whose fields (``E[e][5]``)
+      contain that name;
+    * ``peak`` is the maximum level touched by the events of ``I``,
+      comparing each event's before level ``E[e][3][0]`` with its after
+      level ``E[e][4][0]``; when ``I`` is empty it is ``None``.
+
+    ``overview`` is
+    ``[len(E), count of non-empty I, global up count, global down
+    count, global shift count]``; the global direction counts cover
+    every event of ``E`` once.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``events``, ``configs`` and ``overview``; the first two values are
+    copies of the same-named values of ``S``. Every container is
+    recursively copied and JSON-compatible (``None`` values kept,
+    numbers never rounded); the inputs are never modified.
+    """
+    summary = audit_trend_summary(snapshots, sizes, settings)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    source_events = summary["events"]
+    config_events = summary["config_events"]
+    p_count = len(settings)
+
+    direction_index = {"up": 0, "down": 1, "shift": 2}
+    field_index = {"level": 0, "first_bad": 1, "first_good": 2}
+
+    events: list = []
+    for e, entry in enumerate(source_events):
+        columns = sorted({entry[1][1], entry[2][1]})
+        events.append([e] + [_copy(item) for item in entry] + [columns])
+
+    configs: list = []
+    non_empty_configs = 0
+    for p in range(p_count):
+        indices = list(config_events[p])
+        direction_counts = [0, 0, 0]
+        field_counts = [0, 0, 0]
+        peak: int | None = None
+        if indices:
+            non_empty_configs += 1
+        for e in indices:
+            entry = source_events[e]
+            direction_counts[direction_index[entry[6]]] += 1
+            for field in entry[5]:
+                field_counts[field_index[field]] += 1
+            for level in (entry[3][0], entry[4][0]):
+                if peak is None or level > peak:
+                    peak = level
+        configs.append(
+            [
+                p,
+                _copy(summary["settings"][p]),
+                indices,
+                direction_counts,
+                field_counts,
+                peak,
+            ]
+        )
+
+    global_direction_counts = [0, 0, 0]
+    for entry in source_events:
+        global_direction_counts[direction_index[entry[6]]] += 1
+
+    overview = [
+        len(source_events),
+        non_empty_configs,
+        global_direction_counts[0],
+        global_direction_counts[1],
+        global_direction_counts[2],
+    ]
+
+    return {
+        "sizes": _copy(summary["sizes"]),
+        "settings": _copy(summary["settings"]),
+        "events": events,
+        "configs": configs,
+        "overview": overview,
     }
 
 
