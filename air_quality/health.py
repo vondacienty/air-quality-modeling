@@ -11,6 +11,7 @@ __all__ = [
     "alert_region_advance",
     "alert_region_plan",
     "alert_region_progress",
+    "alert_region_recover",
     "alert_region_step",
     "aggregate",
     "aggregate_correlated",
@@ -13950,7 +13951,7 @@ def _alert_region_check_number_list(value: object, name: str) -> None:
                 f"{name}[{index}] must be an int or float, "
                 f"got {type(item).__name__}"
             )
-        if not math.isfinite(float(item)):
+        if isinstance(item, float) and not math.isfinite(item):
             raise ValueError(
                 f"{name}[{index}] must be finite, got {item!r}"
             )
@@ -14604,7 +14605,9 @@ def alert_region_advance(
         for pre_state, post_state, step_finish, step_retry
         in normalized_history
     ]
-    history_out.extend(checkpoints)
+    history_out.extend(
+        _alert_region_copy(checkpoint) for checkpoint in checkpoints
+    )
 
     return {
         "thresholds": _alert_region_copy(validated["thresholds"]),
@@ -14614,6 +14617,412 @@ def alert_region_advance(
         "checkpoints": checkpoints,
         "history": history_out,
         "changes": changes,
+    }
+
+
+def _alert_region_derive_state(value: object, where: str) -> tuple[list, set]:
+    """Normalize a ``[D, F, U]`` state and derive its region universe.
+
+    Same type/shape/disjointness contract as
+    :func:`_alert_region_normalize_state` but the universe is the union
+    of the three groups themselves, used to seed the universe shared by
+    the records before later states are checked against it.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            f"{where} must be a list or tuple, got {type(value).__name__}"
+        )
+    if len(value) != 3:
+        raise ValueError(
+            f"{where} must have exactly 3 groups [D, F, U], "
+            f"got {len(value)}"
+        )
+    groups = [
+        _alert_region_normalize_group(value[group_index], f"{where}[{group_index}]")
+        for group_index in range(3)
+    ]
+    group_sets = [set(group) for group in groups]
+    for left, right in ((0, 1), (0, 2), (1, 2)):
+        shared = sorted(group_sets[left] & group_sets[right])
+        if shared:
+            raise ValueError(
+                f"{where} groups must be pairwise disjoint, group "
+                f"{left} and group {right} share id(s): {shared}"
+            )
+    return groups, group_sets[0] | group_sets[1] | group_sets[2]
+
+
+def alert_region_recover(records: list | tuple, cursor: int = 0) -> dict:
+    """Replay :func:`alert_region_advance` records to recover a state.
+
+    ``records`` must be a non-empty list or tuple; a wrong container
+    type raises ``TypeError`` and an empty container raises
+    ``ValueError``. Every item must be a result of
+    :func:`alert_region_advance`: a dict whose seven keys are exactly
+    ``thresholds``, ``minimums``, ``cursor``, ``state``,
+    ``checkpoints``, ``history`` and ``changes``. A non-dict item raises
+    ``TypeError``; a dict with a missing or extra key, or any
+    structurally invalid field, raises ``ValueError``.
+
+    Each record's ``thresholds`` and ``minimums`` are validated with the
+    :func:`alert_region_step` rules (non-empty finite int/float lists;
+    ints are never converted to float). ``state`` must be a ``[D, F,
+    U]`` partition over one region universe shared by every record.
+    ``history`` and ``checkpoints`` are lists of the four-item
+    ``[[D, F, U], [D', F', U'], finish, retry]`` checkpoints; every
+    item's states must partition the shared universe, its finish ids
+    must come from its pre-state ``U`` and its retry ids from its
+    pre-state ``F``, and its post-state must equal that finish/retry
+    transfer. ``cursor`` must be a non-bool int in the range
+    ``0..len(history)`` marking where this call appended its steps, and
+    ``checkpoints`` must equal that history's tail
+    ``history[cursor:]``. ``changes`` must be a list with one entry
+    per checkpoint; each entry is a list of ``[p, finished_ids,
+    retried_ids]`` items with a non-bool int ``p`` and unique-id lists.
+    A wrong container, item, scalar or id type raises ``TypeError``; an
+    empty/non-finite number list, a wrong length, a duplicate id,
+    crossing groups, a missing/extra id, a non-matching per-item
+    transfer, a cursor outside the history range, a checkpoints/history-
+    tail mismatch or a changes/checkpoints length mismatch raises
+    ``ValueError``.
+
+    Consecutive records must describe one consistent run, or a
+    ``RuntimeError`` is raised: every record's ``thresholds`` and
+    ``minimums`` equal the first record's, each record's ``state``
+    equals the post-state of its last history checkpoint, the full last
+    history must be internally chained (each checkpoint's pre-state
+    equals the previous checkpoint's post-state), each later record's
+    ``cursor`` must equal the previous record's history length and its
+    history must have the previous record's history as a prefix (an
+    empty-history record must keep the previous state). The first
+    record may carry an empty history, which has no checkpoint to anchor
+    its state against.
+
+    ``cursor`` must be a non-bool int inside the last record's history
+    range ``0..len(history)``; a wrong type raises ``TypeError`` and an
+    out-of-range value raises ``ValueError``.
+
+    Returns a dict whose keys in order are ``state``, ``final``,
+    ``history``, ``pending`` and ``configs``: ``state`` is the
+    post-state of ``history[cursor - 1]`` (the first checkpoint's
+    pre-state when ``cursor`` is 0, or ``final`` when the history is
+    empty); ``final`` is the last record's ``state``; ``history``
+    recursively copies the last record's history; ``pending`` lists, in
+    order, one ``[finish, retry]`` pair per checkpoint of
+    ``history[cursor:]``; and ``configs`` lists one
+    ``[p, finished_ids, retried_ids]`` per configuration ``p`` in
+    ascending ``p`` order, accumulating the documented steps (the
+    records' ``changes``) whose history position precedes ``cursor``, in
+    step order, keeping occurrence order and duplicates. Every container
+    is recursively copied and JSON-compatible (numbers never rounded);
+    the inputs are never modified.
+    """
+    record_keys = (
+        "thresholds",
+        "minimums",
+        "cursor",
+        "state",
+        "checkpoints",
+        "history",
+        "changes",
+    )
+
+    if not isinstance(records, (list, tuple)):
+        raise TypeError(
+            f"records must be a list or tuple, got {type(records).__name__}"
+        )
+    if len(records) == 0:
+        raise ValueError("records must not be empty")
+
+    parsed: list = []
+    universe: set[int] = set()
+    prev_history: list | None = None
+    ref_thresholds: object = None
+    ref_minimums: object = None
+    for record_index, record in enumerate(records):
+        where = f"records[{record_index}]"
+        if not isinstance(record, dict):
+            raise TypeError(
+                f"{where} must be a dict, got {type(record).__name__}"
+            )
+        if set(record.keys()) != set(record_keys):
+            raise ValueError(
+                f"{where} must have exactly the keys {list(record_keys)!r}, "
+                f"got keys {list(record)!r}"
+            )
+
+        thresholds = record["thresholds"]
+        minimums = record["minimums"]
+        _alert_region_check_number_list(thresholds, f"{where}['thresholds']")
+        _alert_region_check_number_list(minimums, f"{where}['minimums']")
+
+        record_cursor = record["cursor"]
+        if not isinstance(record_cursor, int) or isinstance(record_cursor, bool):
+            raise TypeError(
+                f"{where}['cursor'] must be a non-bool int, got "
+                f"{type(record_cursor).__name__}"
+            )
+
+        if record_index == 0:
+            normalized_state, universe = _alert_region_derive_state(
+                record["state"], f"{where}['state']"
+            )
+        else:
+            normalized_state = _alert_region_normalize_state(
+                record["state"], f"{where}['state']", universe
+            )
+
+        checkpoints_raw = record["checkpoints"]
+        if not isinstance(checkpoints_raw, (list, tuple)):
+            raise TypeError(
+                f"{where}['checkpoints'] must be a list or tuple, got "
+                f"{type(checkpoints_raw).__name__}"
+            )
+        normalized_checkpoints = _alert_region_normalize_history(
+            checkpoints_raw, universe
+        )
+
+        history_raw = record["history"]
+        if not isinstance(history_raw, (list, tuple)):
+            raise TypeError(
+                f"{where}['history'] must be a list or tuple, got "
+                f"{type(history_raw).__name__}"
+            )
+        normalized_history = _alert_region_normalize_history(
+            history_raw, universe
+        )
+
+        if record_cursor < 0 or record_cursor > len(history_raw):
+            raise ValueError(
+                f"{where}['cursor'] must be in [0, {len(history_raw)}] "
+                f"(the history length), got {record_cursor}"
+            )
+
+        changes_raw = record["changes"]
+        if not isinstance(changes_raw, (list, tuple)):
+            raise TypeError(
+                f"{where}['changes'] must be a list or tuple, got "
+                f"{type(changes_raw).__name__}"
+            )
+        normalized_changes: list = []
+        for step_index, step_changes in enumerate(changes_raw):
+            if not isinstance(step_changes, (list, tuple)):
+                raise TypeError(
+                    f"{where}['changes'][{step_index}] must be a list or "
+                    f"tuple, got {type(step_changes).__name__}"
+                )
+            normalized_step: list = []
+            for change_index, entry in enumerate(step_changes):
+                entry_where = (
+                    f"{where}['changes'][{step_index}][{change_index}]"
+                )
+                if not isinstance(entry, (list, tuple)):
+                    raise TypeError(
+                        f"{entry_where} must be a list or tuple, got "
+                        f"{type(entry).__name__}"
+                    )
+                if len(entry) != 3:
+                    raise ValueError(
+                        f"{entry_where} must have exactly 3 items "
+                        f"[p, finished_ids, retried_ids], got {len(entry)}"
+                    )
+                p_value = entry[0]
+                if not isinstance(p_value, int) or isinstance(p_value, bool):
+                    raise TypeError(
+                        f"{entry_where}[0] (p) must be a non-bool int, got "
+                        f"{type(p_value).__name__}"
+                    )
+                finished = _alert_region_normalize_id_list(
+                    entry[1], f"{entry_where}[1] (finished)"
+                )
+                retried = _alert_region_normalize_id_list(
+                    entry[2], f"{entry_where}[2] (retried)"
+                )
+                if not finished and not retried:
+                    raise ValueError(
+                        f"{entry_where} must list at least one finished or "
+                        "retried id"
+                    )
+                normalized_step.append([p_value, finished, retried])
+            normalized_changes.append(normalized_step)
+
+        if len(normalized_changes) != len(normalized_checkpoints):
+            raise ValueError(
+                f"{where}['changes'] length ({len(normalized_changes)}) must "
+                f"equal checkpoints length ({len(normalized_checkpoints)})"
+            )
+
+        # Every documented change must concern an id actually moved by
+        # the matching step's checkpoint.
+        for step_index, (step_changes, checkpoint) in enumerate(
+            zip(normalized_changes, normalized_checkpoints)
+        ):
+            step_finish_set = set(checkpoint[2])
+            step_retry_set = set(checkpoint[3])
+            for p_value, finished, retried in step_changes:
+                bad_finished = sorted(
+                    region_id for region_id in finished
+                    if region_id not in step_finish_set
+                )
+                if bad_finished:
+                    raise ValueError(
+                        f"{where}['changes'][{step_index}] p={p_value} lists "
+                        f"finished id(s) not moved by the step: "
+                        f"{bad_finished}"
+                    )
+                bad_retried = sorted(
+                    region_id for region_id in retried
+                    if region_id not in step_retry_set
+                )
+                if bad_retried:
+                    raise ValueError(
+                        f"{where}['changes'][{step_index}] p={p_value} lists "
+                        f"retried id(s) not moved by the step: "
+                        f"{bad_retried}"
+                    )
+
+        # The checkpoints produced by this advance call are exactly the
+        # new history tail starting at its cursor.
+        expected_new = normalized_history[record_cursor:]
+        if len(expected_new) != len(normalized_checkpoints):
+            raise ValueError(
+                f"{where} history grows by {len(expected_new)} checkpoint(s) "
+                f"from its cursor but checkpoints has "
+                f"{len(normalized_checkpoints)}"
+            )
+        for new_index, (expected, actual) in enumerate(
+            zip(expected_new, normalized_checkpoints)
+        ):
+            if expected != actual:
+                raise ValueError(
+                    f"{where}['checkpoints'][{new_index}] must equal the "
+                    "matching new history checkpoint"
+                )
+
+        # This record's reported state is the post-state reached by its
+        # last history checkpoint; a mismatch is a chaining fault. A
+        # record that produced no steps may carry an empty history (only
+        # possible for the first record of a chain), which has no
+        # checkpoint to anchor against.
+        if normalized_history and normalized_state != normalized_history[-1][1]:
+            raise RuntimeError(
+                f"{where}['state'] does not equal the post-state of its "
+                "last history checkpoint"
+            )
+
+        # Cross-record consistency is a chaining fault, not a structural
+        # one: axis values stay identical and histories grow by prefix.
+        if record_index == 0:
+            ref_thresholds = thresholds
+            ref_minimums = minimums
+        else:
+            assert prev_history is not None
+            if thresholds != ref_thresholds:
+                raise RuntimeError(
+                    f"{where}['thresholds'] does not match the first "
+                    f"record's thresholds"
+                )
+            if minimums != ref_minimums:
+                raise RuntimeError(
+                    f"{where}['minimums'] does not match the first record's "
+                    f"minimums"
+                )
+            if record_cursor != len(prev_history):
+                raise RuntimeError(
+                    f"{where}['cursor'] ({record_cursor}) must equal the "
+                    f"previous record's history length "
+                    f"({len(prev_history)})"
+                )
+            if len(normalized_history) < len(prev_history):
+                raise RuntimeError(
+                    f"{where}['history'] must extend the previous record's "
+                    f"history, got lengths {len(normalized_history)} and "
+                    f"{len(prev_history)}"
+                )
+            if normalized_history[: len(prev_history)] != prev_history:
+                raise RuntimeError(
+                    f"{where}['history'] must have the previous record's "
+                    "history as a prefix"
+                )
+            if not normalized_history and normalized_state != parsed[-1]["state"]:
+                raise RuntimeError(
+                    f"{where} has an empty history but its state does not "
+                    "equal the previous record's state"
+                )
+
+        parsed.append(
+            {
+                "cursor": record_cursor,
+                "state": normalized_state,
+                "checkpoints": normalized_checkpoints,
+                "history": normalized_history,
+                "changes": normalized_changes,
+            }
+        )
+        prev_history = normalized_history
+
+    last = parsed[-1]
+    last_history = last["history"]
+    last_state = last["state"]
+
+    # The full final history must be internally chained and end in the
+    # last record's state. An empty history has no checkpoint to anchor
+    # against; a structurally valid state is then accepted.
+    if last_history:
+        _alert_region_check_history_chain(last_history, last_state)
+
+    if not isinstance(cursor, int) or isinstance(cursor, bool):
+        raise TypeError(
+            f"cursor must be a non-bool int, got {type(cursor).__name__}"
+        )
+    if not 0 <= cursor <= len(last_history):
+        raise ValueError(
+            f"cursor must be in [0, {len(last_history)}], got {cursor}"
+        )
+
+    if cursor == 0:
+        if last_history:
+            recovered_state = _alert_region_copy(last_history[0][0])
+        else:
+            recovered_state = _alert_region_copy(last_state)
+    else:
+        recovered_state = _alert_region_copy(last_history[cursor - 1][1])
+
+    pending = [
+        [_alert_region_copy(checkpoint[2]), _alert_region_copy(checkpoint[3])]
+        for checkpoint in last_history[cursor:]
+    ]
+
+    # Accumulate the documented steps whose global history position is
+    # below ``cursor``. A record's step t sits at history position
+    # record_cursor + t; ids are appended in step order with duplicates
+    # preserved (no set de-duplication).
+    finished_by_p: dict[int, list] = {}
+    retried_by_p: dict[int, list] = {}
+    for record in parsed:
+        record_cursor = record["cursor"]
+        local_limit = min(
+            len(record["changes"]), max(0, cursor - record_cursor)
+        )
+        for step_changes in record["changes"][:local_limit]:
+            for p_value, finished, retried in step_changes:
+                finished_by_p.setdefault(p_value, []).extend(finished)
+                retried_by_p.setdefault(p_value, []).extend(retried)
+    configs = [
+        [
+            p_value,
+            _alert_region_copy(finished_by_p[p_value]),
+            _alert_region_copy(retried_by_p[p_value]),
+        ]
+        for p_value in sorted(finished_by_p)
+    ]
+
+    return {
+        "state": recovered_state,
+        "final": _alert_region_copy(last_state),
+        "history": _alert_region_copy(last_history),
+        "pending": pending,
+        "configs": configs,
     }
 
 
