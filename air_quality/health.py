@@ -15,6 +15,7 @@ __all__ = [
     "audit_delta",
     "audit_reconcile",
     "audit_trend_grid",
+    "audit_trend_summary",
     "audit_trend_turns",
     "audit_window_report",
     "audit_window_trend",
@@ -12731,6 +12732,104 @@ def audit_trend_turns(
         "size_changes": size_changes,
         "setting_changes": setting_changes,
         "consistency": consistency,
+    }
+
+
+def audit_trend_summary(
+    snapshots: list | tuple,
+    sizes: list | tuple,
+    settings: list | tuple,
+) -> dict:
+    """Summarize trend-warning change events along both grid axes.
+
+    ``snapshots``, ``sizes`` and ``settings`` share the exact contract
+    of :func:`audit_trend_turns` (every ``TypeError`` and
+    ``ValueError`` is inherited verbatim; exceptions propagate
+    unchanged).
+
+    :func:`audit_trend_turns` is called exactly once to obtain ``T``.
+    Its ``size_changes`` are walked first and its ``setting_changes``
+    second, each in their stored order; every item ``x`` is normalized
+    as ``[axis, x[0], x[1], x[2], x[3], x[4], direction]`` with
+    ``axis = "size"`` or ``"setting"`` respectively. ``direction``
+    compares ``x[3][0]`` with ``x[2][0]``: ``"up"`` when the latter
+    value is larger, ``"down"`` when smaller and ``"shift"`` when
+    equal. The normalized events are indexed by their 0-based position
+    ``e``.
+
+    ``config_events`` maps each ``p`` that occurs as the second item of
+    either endpoint coordinate to the ascending list of event indices
+    touching it (each event at most once per ``p``). ``field_events`` is
+    a dict with keys in the order ``level``, ``first_bad``,
+    ``first_good``; each list collects the events whose ``x[4]``
+    contains that field name. ``direction_events`` is a dict with keys
+    in the order ``up``, ``down``, ``shift``; each list collects the
+    events with that direction. Every index list is in ascending order.
+
+    Returns a dict whose keys in order are ``sizes``, ``settings``,
+    ``events``, ``config_events``, ``field_events`` and
+    ``direction_events``; the first two values are taken from ``T``.
+    Every container is recursively copied and JSON-compatible
+    (``None`` values kept, numbers never rounded); the inputs are never
+    modified.
+    """
+    turns = audit_trend_turns(snapshots, sizes, settings)
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    events: list = []
+    axes = (
+        ("size", turns["size_changes"]),
+        ("setting", turns["setting_changes"]),
+    )
+    for axis, changes in axes:
+        for x in changes:
+            former_level = x[2][0]
+            latter_level = x[3][0]
+            if latter_level > former_level:
+                direction = "up"
+            elif latter_level < former_level:
+                direction = "down"
+            else:
+                direction = "shift"
+            events.append(
+                [
+                    axis,
+                    _copy(x[0]),
+                    _copy(x[1]),
+                    _copy(x[2]),
+                    _copy(x[3]),
+                    _copy(x[4]),
+                    direction,
+                ]
+            )
+
+    config_events: dict = {}
+    field_events = {"level": [], "first_bad": [], "first_good": []}
+    direction_events = {"up": [], "down": [], "shift": []}
+    for e, event in enumerate(events):
+        endpoint_ps = [event[1][1]]
+        if event[2][1] != endpoint_ps[0]:
+            endpoint_ps.append(event[2][1])
+        for p in endpoint_ps:
+            config_events.setdefault(p, []).append(e)
+        for name in field_events:
+            if name in event[5]:
+                field_events[name].append(e)
+        direction_events[event[6]].append(e)
+
+    return {
+        "sizes": _copy(turns["sizes"]),
+        "settings": _copy(turns["settings"]),
+        "events": events,
+        "config_events": config_events,
+        "field_events": field_events,
+        "direction_events": direction_events,
     }
 
 
