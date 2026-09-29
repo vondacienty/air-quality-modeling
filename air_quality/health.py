@@ -10,6 +10,7 @@ from .gaussian import _check_finite, _is_number
 __all__ = [
     "alert_region_plan",
     "alert_region_progress",
+    "alert_region_step",
     "aggregate",
     "aggregate_correlated",
     "any_receptor_probability",
@@ -13833,6 +13834,364 @@ def alert_region_progress(
         "batches": batches,
         "layers": layers,
         "configs": configs,
+    }
+
+
+def alert_region_step(
+    progress: dict,
+    finish: list | tuple,
+    retry: list | tuple,
+    history: list | tuple = (),
+) -> dict:
+    """Apply one finish/retry step to the alert-region execution progress.
+
+    ``progress`` must be a result of :func:`alert_region_progress`; a
+    non-dict value raises ``TypeError``. It must contain exactly the
+    keys ``thresholds``, ``minimums``, ``state``, ``batches``,
+    ``layers`` and ``configs``; a missing or extra key raises
+    ``ValueError``. ``state`` is read as ``[D, F, U]``; its three
+    members and the region groups inside ``batches``/``configs`` must be
+    lists/tuples of non-bool int ids (a wrong container or element
+    type, including a bool, raises ``TypeError``), the three partitions
+    must be mutually exclusive and together cover exactly the regions
+    appearing in ``batches`` (a duplicate, out-of-range, cross-
+    partition or missing id raises ``ValueError``). The three
+    partitions are normalized to ascending id order.
+
+    ``finish`` and ``retry`` must each be a list or tuple of unique
+    non-bool int region ids; a wrong container or element type raises
+    ``TypeError`` and a duplicate raises ``ValueError``. Every
+    ``finish`` id must belong to ``U`` and every ``retry`` id to ``F``;
+    an id outside its source partition raises ``RuntimeError``. The
+    step yields ``D' = D union finish``, ``F' = F - retry`` and
+    ``U' = (U - finish) union retry``; ``checkpoint`` is
+    ``[[D, F, U], [D', F', U'], copy(finish), copy(retry)]``, every id
+    list sorted ascending, and its three partitions stay mutually
+    exclusive.
+
+    ``history`` must be a list or tuple of checkpoints produced by
+    earlier calls; a wrong container type raises ``TypeError``. Each
+    item must be a four-element list/tuple: two three-id-partition
+    states followed by the unique finish and retry id lists; any shape
+    or id violation, or an in-item transition whose after-state is not
+    induced by its before-state and finish/retry lists, raises
+    ``ValueError``. Adjacent items must link (each item's after-state
+    equals the next item's before-state) and the last item's
+    after-state must equal the normalized current ``[D, F, U]``; a
+    broken link or a conflicting final state raises ``RuntimeError``.
+
+    Returns a dict whose keys in order are ``thresholds``,
+    ``minimums``, ``checkpoint``, ``history`` and ``changes``: the
+    first two values recursively copy the same-named entries of
+    ``progress``, ``history`` appends a recursive copy of this step's
+    ``checkpoint`` to a recursive copy of the input history, and
+    ``changes`` lists, in the order of ``progress["configs"]``, one
+    ``[p, finished_ids, retried_ids]`` per configuration affected by
+    this step, with ids ascending. Every container is recursively
+    copied and JSON-compatible (numbers never rounded); the inputs are
+    never modified.
+    """
+    if not isinstance(progress, dict):
+        raise TypeError(
+            f"progress must be a dict, got {type(progress).__name__}"
+        )
+    progress_keys = (
+        "thresholds",
+        "minimums",
+        "state",
+        "batches",
+        "layers",
+        "configs",
+    )
+    if set(progress) != set(progress_keys):
+        raise ValueError(
+            f"progress must have keys {list(progress_keys)!r}, "
+            f"got keys {list(progress)!r}"
+        )
+    if not isinstance(finish, (list, tuple)):
+        raise TypeError(
+            f"finish must be a list or tuple, got {type(finish).__name__}"
+        )
+    if not isinstance(retry, (list, tuple)):
+        raise TypeError(
+            f"retry must be a list or tuple, got {type(retry).__name__}"
+        )
+    if not isinstance(history, (list, tuple)):
+        raise TypeError(
+            f"history must be a list or tuple, got {type(history).__name__}"
+        )
+
+    def _copy(value: object) -> object:
+        if isinstance(value, dict):
+            return {key: _copy(value[key]) for key in value}
+        if isinstance(value, list):
+            return [_copy(item) for item in value]
+        return value
+
+    def _validate_ids(name: str, values: list | tuple) -> list:
+        ids: list = []
+        seen: set[int] = set()
+        for index, item in enumerate(values):
+            if not isinstance(item, int) or isinstance(item, bool):
+                raise TypeError(
+                    f"{name}[{index}] must be a non-bool int, "
+                    f"got {type(item).__name__}"
+                )
+            if item in seen:
+                raise ValueError(
+                    f"{name} contains duplicate region id: {item}"
+                )
+            seen.add(item)
+            ids.append(item)
+        return ids
+
+    finish_ids = _validate_ids("finish", finish)
+    retry_ids = _validate_ids("retry", retry)
+
+    state = progress["state"]
+    if not isinstance(state, (list, tuple)) or len(state) != 3:
+        raise ValueError(
+            "progress['state'] must be a [D, F, U] three-item list or "
+            f"tuple, got {state!r}"
+        )
+
+    def _validate_partition(
+        label: str,
+        partition: object,
+        valid_ids: set[int] | None = None,
+    ) -> list:
+        where = f"{label}"
+        if not isinstance(partition, (list, tuple)):
+            raise ValueError(
+                f"{where} must be a list or tuple, got "
+                f"{type(partition).__name__}"
+            )
+        ids: list = []
+        seen: set[int] = set()
+        for index, item in enumerate(partition):
+            if not isinstance(item, int) or isinstance(item, bool):
+                raise TypeError(
+                    f"{where}[{index}] must be a non-bool int, "
+                    f"got {type(item).__name__}"
+                )
+            if item in seen:
+                raise ValueError(
+                    f"{where} contains duplicate region id: {item}"
+                )
+            if valid_ids is not None and item not in valid_ids:
+                raise ValueError(
+                    f"{where} contains out-of-range region id: {item}"
+                )
+            seen.add(item)
+            ids.append(item)
+        return sorted(ids)
+
+    batches = progress["batches"]
+    if not isinstance(batches, (list, tuple)):
+        raise ValueError(
+            "progress['batches'] must be a list or tuple, got "
+            f"{type(batches).__name__}"
+        )
+    region_universe: set[int] = set()
+    for b_index, entry in enumerate(batches):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 5:
+            raise ValueError(
+                f"progress['batches'][{b_index}] must be a five-item list or "
+                f"tuple, got {entry!r}"
+            )
+        for part_index in (1, 2, 3):
+            part = entry[part_index]
+            if not isinstance(part, (list, tuple)):
+                raise ValueError(
+                    f"progress['batches'][{b_index}][{part_index}] must be a "
+                    f"list or tuple, got {type(part).__name__}"
+                )
+            for region_id in part:
+                if not isinstance(region_id, int) or isinstance(region_id, bool):
+                    raise TypeError(
+                        f"progress['batches'][{b_index}][{part_index}] "
+                        f"contains a non-int region id: {region_id!r}"
+                    )
+                region_universe.add(region_id)
+
+    configs = progress["configs"]
+    if not isinstance(configs, (list, tuple)):
+        raise ValueError(
+            "progress['configs'] must be a list or tuple, got "
+            f"{type(configs).__name__}"
+        )
+    for c_index, entry in enumerate(configs):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 4:
+            raise ValueError(
+                f"progress['configs'][{c_index}] must be a four-item list or "
+                f"tuple, got {entry!r}"
+            )
+        p_value = entry[0]
+        if not isinstance(p_value, int) or isinstance(p_value, bool):
+            raise TypeError(
+                f"progress['configs'][{c_index}][0] must be a non-bool "
+                f"int, got {type(p_value).__name__}"
+            )
+        for part_index in (1, 2, 3):
+            part = entry[part_index]
+            if not isinstance(part, (list, tuple)):
+                raise ValueError(
+                    f"progress['configs'][{c_index}][{part_index}] must be "
+                    f"a list or tuple, got {type(part).__name__}"
+                )
+            for region_id in part:
+                if not isinstance(region_id, int) or isinstance(region_id, bool):
+                    raise TypeError(
+                        f"progress['configs'][{c_index}][{part_index}] "
+                        f"contains a non-int region id: {region_id!r}"
+                    )
+
+    d_ids = _validate_partition("progress['state'][0] (D)", state[0], region_universe)
+    f_ids = _validate_partition("progress['state'][1] (F)", state[1], region_universe)
+    u_ids = _validate_partition("progress['state'][2] (U)", state[2], region_universe)
+
+    d_set, f_set, u_set = set(d_ids), set(f_ids), set(u_ids)
+    if d_set & f_set or d_set & u_set or f_set & u_set:
+        overlap = sorted(
+            (d_set & f_set) | (d_set & u_set) | (f_set & u_set)
+        )
+        raise ValueError(
+            f"D, F and U must be mutually exclusive, shared id(s): {overlap}"
+        )
+    if d_set | f_set | u_set != region_universe:
+        missing = sorted(region_universe - (d_set | f_set | u_set))
+        extra = sorted((d_set | f_set | u_set) - region_universe)
+        raise ValueError(
+            "state partition must cover exactly the configs regions; "
+            f"missing id(s): {missing}, extra id(s): {extra}"
+        )
+
+    bad_finish = sorted(region_id for region_id in finish_ids if region_id not in u_set)
+    if bad_finish:
+        raise RuntimeError(
+            "finish ids must be regions currently unlisted (U); "
+            f"invalid id(s): {bad_finish}"
+        )
+    bad_retry = sorted(region_id for region_id in retry_ids if region_id not in f_set)
+    if bad_retry:
+        raise RuntimeError(
+            "retry ids must be regions currently failed (F); "
+            f"invalid id(s): {bad_retry}"
+        )
+
+    finish_set = set(finish_ids)
+    retry_set = set(retry_ids)
+    d_after = sorted(d_set | finish_set)
+    f_after = sorted(f_set - retry_set)
+    u_after = sorted((u_set - finish_set) | retry_set)
+
+    checkpoint = [
+        [list(d_ids), list(f_ids), list(u_ids)],
+        [d_after, f_after, u_after],
+        sorted(finish_ids),
+        sorted(retry_ids),
+    ]
+
+    def _validate_history_item(item: object, index: int) -> tuple[list, list]:
+        prefix = f"history[{index}]"
+        if not isinstance(item, (list, tuple)) or len(item) != 4:
+            raise ValueError(
+                f"{prefix} must be a four-item list or tuple, got {item!r}"
+            )
+        before, after = item[0], item[1]
+        if not isinstance(before, (list, tuple)) or len(before) != 3:
+            raise ValueError(
+                f"{prefix}[0] must be a three-item partition, got {before!r}"
+            )
+        if not isinstance(after, (list, tuple)) or len(after) != 3:
+            raise ValueError(
+                f"{prefix}[1] must be a three-item partition, got {after!r}"
+            )
+        _validate_partition(f"{prefix}[0][0]", before[0])
+        _validate_partition(f"{prefix}[0][1]", before[1])
+        _validate_partition(f"{prefix}[0][2]", before[2])
+        _validate_partition(f"{prefix}[1][0]", after[0])
+        _validate_partition(f"{prefix}[1][1]", after[1])
+        _validate_partition(f"{prefix}[1][2]", after[2])
+        before_sets = [set(part) for part in before]
+        after_sets = [set(part) for part in after]
+        for sets in (before_sets, after_sets):
+            if sets[0] & sets[1] or sets[0] & sets[2] or sets[1] & sets[2]:
+                overlap = sorted(
+                    (sets[0] & sets[1])
+                    | (sets[0] & sets[2])
+                    | (sets[1] & sets[2])
+                )
+                raise ValueError(
+                    f"{prefix} partitions must be mutually exclusive, shared "
+                    f"id(s): {overlap}"
+                )
+        item_finish = _validate_partition(f"{prefix}[2]", item[2])
+        item_retry = _validate_partition(f"{prefix}[3]", item[3])
+        bad_finish = [
+            region_id for region_id in item_finish
+            if region_id not in before_sets[2]
+        ]
+        bad_retry = [
+            region_id for region_id in item_retry
+            if region_id not in before_sets[1]
+        ]
+        if bad_finish or bad_retry:
+            raise ValueError(
+                f"{prefix} finish/retry ids are outside their source "
+                f"partitions (finish must be in U, retry in F): "
+                f"finish {bad_finish}, retry {bad_retry}"
+            )
+        expected_after = [
+            sorted(before_sets[0] | set(item_finish)),
+            sorted(before_sets[1] - set(item_retry)),
+            sorted((before_sets[2] - set(item_finish)) | set(item_retry)),
+        ]
+        if [sorted(part) for part in after] != expected_after:
+            raise ValueError(
+                f"{prefix} after-state does not match the transition implied "
+                f"by its finish/retry lists"
+            )
+        return [sorted(part) for part in before], [sorted(part) for part in after]
+
+    history_copy: list = []
+    previous_after: list | None = None
+    for index, item in enumerate(history):
+        before, after = _validate_history_item(item, index)
+        if previous_after is not None and before != previous_after:
+            raise RuntimeError(
+                f"history[{index}] before-state does not link to the previous "
+                f"checkpoint's after-state"
+            )
+        previous_after = after
+        history_copy.append(_copy(item))
+
+    current_state = [d_ids, f_ids, u_ids]
+    if previous_after is not None and previous_after != current_state:
+        raise RuntimeError(
+            "the last history checkpoint's after-state does not match the "
+            "current progress state"
+        )
+    history_copy.append(_copy(checkpoint))
+
+    changes: list = []
+    for entry in configs:
+        p_value = entry[0]
+        affected_finish = sorted(
+            region_id for region_id in entry[3] if region_id in finish_set
+        )
+        affected_retry = sorted(
+            region_id for region_id in entry[2] if region_id in retry_set
+        )
+        if affected_finish or affected_retry:
+            changes.append([p_value, affected_finish, affected_retry])
+
+    return {
+        "thresholds": _copy(progress["thresholds"]),
+        "minimums": _copy(progress["minimums"]),
+        "checkpoint": _copy(checkpoint),
+        "history": history_copy,
+        "changes": changes,
     }
 
 
